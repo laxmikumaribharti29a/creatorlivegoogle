@@ -41,6 +41,8 @@ import {
   signInWithGoogle,
   signOutUser,
   onAuthStateChanged,
+  getRedirectResult,
+  firebaseProjectId,
   collection,
   query,
   where,
@@ -242,8 +244,18 @@ export default function App() {
   const [lang, setLang] = useState<Language>('en');
   const t = translations[lang];
 
-  // Admin & Site Store Data
-  const [siteSettings, setSiteSettings] = useState<MainPageSettings>(DEFAULT_SITE_SETTINGS);
+  // Admin & Site Store Data (initialized from localStorage cache if available so saved settings persist immediately)
+  const [siteSettings, setSiteSettings] = useState<MainPageSettings>(() => {
+    try {
+      const cached = localStorage.getItem('creatorlive247_site_settings_v1');
+      if (cached) {
+        return { ...DEFAULT_SITE_SETTINGS, ...JSON.parse(cached) };
+      }
+    } catch {
+      // ignore
+    }
+    return DEFAULT_SITE_SETTINGS;
+  });
   const [managedUsers, setManagedUsers] = useState<ManagedUser[]>([]);
   const [plans, setPlans] = useState<SubscriptionPlan[]>([]);
   const [offers, setOffers] = useState<PromoOffer[]>([]);
@@ -267,9 +279,11 @@ export default function App() {
 
   // Sign In / Mobile Login Modal State
   const [showAuthModal, setShowAuthModal] = useState(false);
-  const [authModalMode, setAuthModalMode] = useState<'mobile' | 'email'>('mobile');
+  const [authModalMode, setAuthModalMode] = useState<'mobile' | 'email' | 'google'>('mobile');
   const [mobileOrEmailInput, setMobileOrEmailInput] = useState('');
   const [nameInput, setNameInput] = useState('');
+  const [googleDomainNotice, setGoogleDomainNotice] = useState<string | null>(null);
+  const authInputRef = useRef<HTMLInputElement | null>(null);
 
   // Upgrade / Plans Modal State
   const [showPlansModal, setShowPlansModal] = useState(false);
@@ -410,13 +424,25 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [showThumbnailToViewers, thumbnailCountdownSec]);
 
-  // Fetch Admin & Site Settings Data (polled so Admin User List permission updates reflect live)
+  // Fetch Admin & Site Settings Data
+  const lastServerSettingsJsonRef = useRef<string>('');
   const fetchAdminData = useCallback(async () => {
     try {
       const res = await fetch('/api/admin/data');
       if (!res.ok) return;
       const data = await res.json();
-      if (data.settings) setSiteSettings(data.settings);
+      if (data.settings) {
+        const nextJson = JSON.stringify(data.settings);
+        if (nextJson !== lastServerSettingsJsonRef.current) {
+          lastServerSettingsJsonRef.current = nextJson;
+          setSiteSettings((prev) => ({ ...prev, ...data.settings }));
+          try {
+            localStorage.setItem('creatorlive247_site_settings_v1', nextJson);
+          } catch {
+            // ignore
+          }
+        }
+      }
       if (Array.isArray(data.users)) setManagedUsers(data.users);
       if (Array.isArray(data.plans)) setPlans(data.plans);
       if (Array.isArray(data.offers)) setOffers(data.offers);
@@ -428,7 +454,9 @@ export default function App() {
 
   useEffect(() => {
     fetchAdminData();
-    const interval = setInterval(fetchAdminData, 4000);
+    const interval = setInterval(() => {
+      fetchAdminData();
+    }, 4000);
     return () => clearInterval(interval);
   }, [fetchAdminData]);
 
@@ -455,8 +483,23 @@ export default function App() {
     [fetchAdminData]
   );
 
-  // 1. Track Firebase Auth state
+  // 1. Track Firebase Auth state & redirect results
   useEffect(() => {
+    getRedirectResult(auth)
+      .then(async (res) => {
+        if (res?.user?.email) {
+          await registerUserInBackend(
+            res.user.email,
+            res.user.displayName || res.user.email.split('@')[0]
+          );
+          setShowAuthModal(false);
+          setActiveView('dashboard');
+        }
+      })
+      .catch(() => {
+        // ignore redirect result warning
+      });
+
     const unsub = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
       setAuthReady(true);
@@ -1175,39 +1218,26 @@ export default function App() {
     }
   };
 
-  // Google Sign-In handler -> Opens User Dashboard after login
-  const handleGoogleLogin = async () => {
+  // Complete login with Email or Mobile & open User Dashboard
+  const completeDirectLogin = async (rawIdentifier: string, rawName?: string) => {
     setAuthError(null);
-    try {
-      const loggedUser = await signInWithGoogle();
-      if (loggedUser.email) {
-        const allowed = await registerUserInBackend(
-          loggedUser.email,
-          loggedUser.displayName || loggedUser.email.split('@')[0]
-        );
-        if (!allowed) return;
-      }
-      setShowAuthModal(false);
-      setActiveView('dashboard');
-    } catch {
-      // If popup is blocked in iframe preview, open the clean Sign-in modal with Google Email ID / Mobile option
-      setAuthModalMode('email');
-      setShowAuthModal(true);
+    const trimmed = rawIdentifier.trim();
+    if (!trimmed) {
+      authInputRef.current?.focus();
+      authInputRef.current?.reportValidity();
+      return;
     }
-  };
 
-  // Mobile or Email Login Submit -> Registers in Admin Users & Opens User Dashboard!
-  const handleMobileOrEmailSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError(null);
-    const cleanVal = mobileOrEmailInput.trim();
-    if (!cleanVal) return;
+    const isPhoneNumber = /^\+?\d[\d\s-]{6,15}$/.test(trimmed);
+    const normalizedIdentifier =
+      !isPhoneNumber && !trimmed.includes('@') ? `${trimmed}@gmail.com` : trimmed;
+    const displayName =
+      (rawName ?? nameInput).trim() || normalizedIdentifier.split('@')[0] || 'Creator';
 
-    const displayName = nameInput.trim() || cleanVal.split('@')[0] || 'Creator';
-    const allowed = await registerUserInBackend(cleanVal, displayName);
+    const allowed = await registerUserInBackend(normalizedIdentifier, displayName);
     if (!allowed) return;
 
-    const sessionObj = { identifier: cleanVal, name: displayName };
+    const sessionObj = { identifier: normalizedIdentifier, name: displayName };
     try {
       localStorage.setItem(LOCAL_USER_STORAGE, JSON.stringify(sessionObj));
     } catch {
@@ -1216,8 +1246,70 @@ export default function App() {
     setLocalSession(sessionObj);
     setMobileOrEmailInput('');
     setNameInput('');
+    setGoogleDomainNotice(null);
     setShowAuthModal(false);
     setActiveView('dashboard');
+  };
+
+  // Google Sign-In handler -> Works both with Firebase Popup AND on Hostinger custom domain
+  const handleGoogleLogin = async () => {
+    setAuthError(null);
+
+    // If modal is already open, either submit the entered Google Email or focus & validate the Google Email input
+    if (showAuthModal) {
+      setAuthModalMode('google');
+      if (mobileOrEmailInput.trim().length > 0) {
+        await completeDirectLogin(mobileOrEmailInput, nameInput);
+      } else {
+        setTimeout(() => {
+          authInputRef.current?.focus();
+          authInputRef.current?.reportValidity();
+        }, 30);
+      }
+      return;
+    }
+
+    const host = window.location.hostname || '';
+    const isDefaultFirebaseHost =
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.run.app') ||
+      host.endsWith('.firebaseapp.com') ||
+      host.endsWith('.web.app');
+
+    // Only attempt Firebase popup automatically on domains authorized by default, or try with instant fallback
+    if (isDefaultFirebaseHost) {
+      try {
+        const loggedUser = await signInWithGoogle();
+        if (loggedUser.email) {
+          const allowed = await registerUserInBackend(
+            loggedUser.email,
+            loggedUser.displayName || loggedUser.email.split('@')[0]
+          );
+          if (!allowed) return;
+        }
+        setGoogleDomainNotice(null);
+        setShowAuthModal(false);
+        setActiveView('dashboard');
+        return;
+      } catch {
+        // Fallback to Google Account Sign-In modal below
+      }
+    }
+
+    // Open Sign-In Modal in Google Account mode & focus Google Email input immediately
+    setGoogleDomainNotice(null);
+    setAuthModalMode('google');
+    setShowAuthModal(true);
+    setTimeout(() => {
+      authInputRef.current?.focus();
+    }, 80);
+  };
+
+  // Mobile or Email Login Submit -> Registers in Admin Users & Opens User Dashboard!
+  const handleMobileOrEmailSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await completeDirectLogin(mobileOrEmailInput, nameInput);
   };
 
   const handleFullSignOut = async () => {
@@ -1526,8 +1618,11 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setAuthModalMode('mobile');
+                setAuthModalMode('google');
                 setShowAuthModal(true);
+                setTimeout(() => {
+                  authInputRef.current?.focus();
+                }, 80);
               }}
               className="px-5 py-2 rounded-full bg-[#0f172a] hover:bg-slate-800 text-white text-xs font-bold transition-colors cursor-pointer"
             >
@@ -1747,6 +1842,10 @@ export default function App() {
             payments={payments}
             activeStreamCount={activeJobs.length}
             onRefreshAdminData={fetchAdminData}
+            onUpdateSettings={(newSettings) => {
+              lastServerSettingsJsonRef.current = JSON.stringify(newSettings);
+              setSiteSettings(newSettings);
+            }}
             onBackToSite={() => setActiveView(isLoggedIn ? 'wizard' : 'home')}
           />
         </main>
@@ -2948,75 +3047,140 @@ export default function App() {
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl max-w-md w-full p-6 sm:p-7 space-y-5 shadow-2xl border border-slate-200">
             <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-xl font-extrabold text-slate-900">
-                  {authModalMode === 'mobile' ? 'Sign up / Login with Mobile' : 'Sign in to Studio'}
-                </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Instant access to 3-Step Live Streaming Setup
-                </p>
+              <div className="flex items-center gap-2.5">
+                {authModalMode === 'google' && <GoogleColorIcon />}
+                <div>
+                  <h3 className="text-xl font-extrabold text-slate-900">
+                    {authModalMode === 'mobile'
+                      ? 'Sign up / Login with Mobile'
+                      : 'Continue with Google'}
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {authModalMode === 'mobile'
+                      ? 'Enter your mobile number to access Live Studio'
+                      : 'Sign in with your Google Account (@gmail.com)'}
+                  </p>
+                </div>
               </div>
               <button
                 type="button"
-                onClick={() => setShowAuthModal(false)}
+                onClick={() => {
+                  setShowAuthModal(false);
+                  setGoogleDomainNotice(null);
+                }}
                 className="p-1 text-slate-400 hover:text-slate-700"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            {/* Continue with Google Button */}
-            <button
-              type="button"
-              onClick={handleGoogleLogin}
-              className="w-full py-3.5 px-5 rounded-full bg-white border border-slate-200 hover:bg-slate-50 text-slate-900 text-xs sm:text-sm font-bold flex items-center justify-center gap-2.5 shadow-2xs transition-colors cursor-pointer"
-            >
-              <GoogleColorIcon />
-              <span>Continue with Google</span>
-            </button>
-
-            <div className="relative flex py-1 items-center">
-              <div className="flex-grow border-t border-slate-200" />
-              <span className="shrink mx-3 text-[11px] font-medium text-slate-400 uppercase">
-                Or continue with Mobile / Email
-              </span>
-              <div className="flex-grow border-t border-slate-200" />
+            {/* Mode Switcher Tabs: Google vs Mobile */}
+            <div className="grid grid-cols-2 gap-2 p-1 rounded-2xl bg-slate-100">
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthModalMode('google');
+                  setTimeout(() => authInputRef.current?.focus(), 40);
+                }}
+                className={`py-2.5 px-3 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                  authModalMode !== 'mobile'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <GoogleColorIcon />
+                <span>Google Account</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthModalMode('mobile');
+                  setTimeout(() => authInputRef.current?.focus(), 40);
+                }}
+                className={`py-2.5 px-3 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                  authModalMode === 'mobile'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Phone className="w-3.5 h-3.5" />
+                <span>Mobile Number</span>
+              </button>
             </div>
 
-            <form onSubmit={handleMobileOrEmailSubmit} className="space-y-3.5">
+            {authError && (
+              <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs font-semibold text-red-700 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleMobileOrEmailSubmit} className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Mobile Number or Google Email ID
-                </label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    {authModalMode === 'mobile'
+                      ? 'Mobile Number'
+                      : 'Google Email ID (@gmail.com)'}
+                  </label>
+                  {authModalMode !== 'mobile' &&
+                    !mobileOrEmailInput.includes('@') &&
+                    mobileOrEmailInput.trim().length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setMobileOrEmailInput(`${mobileOrEmailInput.trim()}@gmail.com`)
+                        }
+                        className="text-[11px] font-bold text-blue-600 hover:text-blue-800 cursor-pointer"
+                      >
+                        + Add @gmail.com
+                      </button>
+                    )}
+                </div>
                 <input
+                  ref={authInputRef}
                   type="text"
                   required
                   value={mobileOrEmailInput}
                   onChange={(e) => setMobileOrEmailInput(e.target.value)}
-                  placeholder="e.g. 9471085404 or name@gmail.com"
+                  placeholder={
+                    authModalMode === 'mobile'
+                      ? 'e.g. 9471085404'
+                      : 'e.g. yourname@gmail.com'
+                  }
                   className="w-full px-3.5 py-2.5 text-sm border border-slate-200 rounded-xl focus:outline-none focus:border-slate-400"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                   Your Name (optional)
                 </label>
                 <input
                   type="text"
                   value={nameInput}
                   onChange={(e) => setNameInput(e.target.value)}
-                  placeholder="e.g. Aditya Anand"
+                  placeholder="e.g. Laxmi Kumari"
                   className="w-full px-3.5 py-2.5 text-sm border border-slate-200 rounded-xl focus:outline-none focus:border-slate-400"
                 />
               </div>
 
-              <button
-                type="submit"
-                className="w-full py-3.5 rounded-full bg-[#0f172a] hover:bg-slate-800 text-white text-xs sm:text-sm font-bold transition-colors cursor-pointer"
-              >
-                Continue to Streaming Setup →
-              </button>
+              {authModalMode !== 'mobile' ? (
+                <button
+                  type="submit"
+                  className="w-full py-3.5 px-5 rounded-full bg-[#0f172a] hover:bg-slate-800 text-white text-xs sm:text-sm font-bold flex items-center justify-center gap-2.5 shadow-sm transition-colors cursor-pointer"
+                >
+                  <GoogleColorIcon />
+                  <span>Continue with Google →</span>
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  className="w-full py-3.5 rounded-full bg-[#0f172a] hover:bg-slate-800 text-white text-xs sm:text-sm font-bold transition-colors cursor-pointer"
+                >
+                  Continue with Mobile →
+                </button>
+              )}
             </form>
           </div>
         </div>

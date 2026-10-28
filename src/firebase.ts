@@ -3,6 +3,8 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signOut as firebaseSignOut,
   onAuthStateChanged,
   User,
@@ -23,22 +25,49 @@ import {
 } from 'firebase/firestore';
 import firebaseConfigJson from '../firebase-applet-config.json';
 
+function cleanEnvValue(val: string | undefined, fallback: string): string {
+  if (!val) return fallback;
+  const trimmed = val.trim();
+  if (
+    !trimmed ||
+    trimmed.startsWith('YOUR_') ||
+    trimmed.startsWith('MY_') ||
+    trimmed === 'undefined' ||
+    trimmed === 'null'
+  ) {
+    return fallback;
+  }
+  return trimmed;
+}
+
 const resolvedFirebaseConfig = {
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || firebaseConfigJson.projectId,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || firebaseConfigJson.appId,
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || firebaseConfigJson.apiKey,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || firebaseConfigJson.authDomain,
-  firestoreDatabaseId:
-    import.meta.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID || firebaseConfigJson.firestoreDatabaseId,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || firebaseConfigJson.storageBucket,
-  messagingSenderId:
-    import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseConfigJson.messagingSenderId,
+  projectId: cleanEnvValue(import.meta.env.VITE_FIREBASE_PROJECT_ID, firebaseConfigJson.projectId),
+  appId: cleanEnvValue(import.meta.env.VITE_FIREBASE_APP_ID, firebaseConfigJson.appId),
+  apiKey: cleanEnvValue(import.meta.env.VITE_FIREBASE_API_KEY, firebaseConfigJson.apiKey),
+  authDomain: cleanEnvValue(
+    import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+    firebaseConfigJson.authDomain
+  ),
+  firestoreDatabaseId: cleanEnvValue(
+    import.meta.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID,
+    firebaseConfigJson.firestoreDatabaseId
+  ),
+  storageBucket: cleanEnvValue(
+    import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+    firebaseConfigJson.storageBucket
+  ),
+  messagingSenderId: cleanEnvValue(
+    import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+    firebaseConfigJson.messagingSenderId
+  ),
 };
 
 const app = initializeApp(resolvedFirebaseConfig);
 export const db = getFirestore(app, resolvedFirebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: 'select_account' });
+export const firebaseProjectId = resolvedFirebaseConfig.projectId;
 
 // Validate connection to Firestore on boot as required
 async function testConnection() {
@@ -145,12 +174,17 @@ export async function signInWithGoogle(): Promise<User> {
   return result.user;
 }
 
+export async function signInWithGoogleRedirect(): Promise<void> {
+  await signInWithRedirect(auth, googleProvider);
+}
+
 export async function signOutUser(): Promise<void> {
   await firebaseSignOut(auth);
 }
 
 export {
   onAuthStateChanged,
+  getRedirectResult,
   collection,
   query,
   where,
@@ -162,3 +196,4 @@ export {
   serverTimestamp,
 };
 export type { User };
+

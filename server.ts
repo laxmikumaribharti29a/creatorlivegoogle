@@ -331,9 +331,12 @@ function loadAdminStore() {
 
 function saveAdminStore() {
   try {
+    if (!fs.existsSync(UPLOADS_DIR)) {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    }
     fs.writeFileSync(ADMIN_DATA_FILE, JSON.stringify(adminStore, null, 2), 'utf-8');
-  } catch {
-    // ignore
+  } catch (err) {
+    console.warn('saveAdminStore warning:', err);
   }
 }
 
@@ -604,6 +607,12 @@ async function startServer() {
 
   const app = express();
   const httpServer = createServer(app);
+
+  // Allow Firebase Google Auth popups to communicate with parent window on Hostinger custom domain
+  app.use((_req, res, next) => {
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    next();
+  });
 
   app.use(express.json({ limit: '25mb' }));
   app.use('/uploads', express.static(UPLOADS_DIR));
