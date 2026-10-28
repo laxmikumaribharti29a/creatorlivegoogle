@@ -1,0 +1,199 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Hardened Primitives
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation Blueprint: StreamKey
+    function isValidStreamKey(data) {
+      return data.keys().hasAll([
+          'userId',
+          'platform',
+          'channelName',
+          'streamKey',
+          'rtmpUrl',
+          'enabled',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'userId',
+          'platform',
+          'channelName',
+          'streamKey',
+          'rtmpUrl',
+          'enabled',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.userId is string
+        && data.userId.size() >= 1
+        && data.userId.size() <= 128
+        && data.userId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.userId == request.auth.uid
+        && data.platform is string
+        && data.platform.size() >= 1
+        && data.platform.size() <= 32
+        && (data.platform == 'youtube' || data.platform == 'facebook' || data.platform == 'custom')
+        && data.channelName is string
+        && data.channelName.size() <= 100
+        && data.streamKey is string
+        && data.streamKey.size() >= 1
+        && data.streamKey.size() <= 512
+        && data.rtmpUrl is string
+        && data.rtmpUrl.size() >= 5
+        && data.rtmpUrl.size() <= 512
+        && data.enabled is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: StreamSession
+    function isValidStreamSession(data) {
+      return data.keys().hasAll([
+          'userId',
+          'title',
+          'sourceType',
+          'videoFileName',
+          'videoServerId',
+          'orientation',
+          'quality',
+          'fps',
+          'loop247',
+          'status',
+          'destinations',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'userId',
+          'title',
+          'sourceType',
+          'videoFileName',
+          'videoServerId',
+          'orientation',
+          'quality',
+          'fps',
+          'loop247',
+          'status',
+          'destinations',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.userId is string
+        && data.userId.size() >= 1
+        && data.userId.size() <= 128
+        && data.userId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.userId == request.auth.uid
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 160
+        && data.sourceType is string
+        && data.sourceType.size() >= 1
+        && data.sourceType.size() <= 32
+        && (data.sourceType == 'camera' || data.sourceType == 'screen' || data.sourceType == 'video')
+        && data.videoFileName is string
+        && data.videoFileName.size() <= 256
+        && data.videoServerId is string
+        && data.videoServerId.size() <= 128
+        && data.orientation is string
+        && data.orientation.size() >= 1
+        && data.orientation.size() <= 32
+        && (data.orientation == 'landscape' || data.orientation == 'portrait')
+        && data.quality is string
+        && data.quality.size() >= 1
+        && data.quality.size() <= 16
+        && (data.quality == '480p' || data.quality == '720p' || data.quality == '1080p')
+        && data.fps is int
+        && (data.fps == 30 || data.fps == 60)
+        && data.loop247 is bool
+        && data.status is string
+        && data.status.size() >= 1
+        && data.status.size() <= 32
+        && (data.status == 'live' || data.status == 'stopped')
+        && data.destinations is string
+        && data.destinations.size() >= 1
+        && data.destinations.size() <= 256
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Collection: /streamKeys/{keyId}
+    match /streamKeys/{keyId} {
+      allow get: if isSignedIn() && isValidId(keyId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && isValidId(keyId)
+        && isValidStreamKey(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn()
+        && isValidId(keyId)
+        && isValidStreamKey(incoming())
+        && existing().userId == request.auth.uid
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Toggle enabled state
+          incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'updatedAt']) ||
+          // Action 2: Edit stream key details
+          incoming().diff(existing()).affectedKeys().hasOnly(['channelName', 'streamKey', 'rtmpUrl', 'enabled', 'updatedAt'])
+        );
+
+      allow delete: if isSignedIn() && isValidId(keyId) && existing().userId == request.auth.uid;
+    }
+
+    // Collection: /streamSessions/{sessionId}
+    match /streamSessions/{sessionId} {
+      allow get: if isSignedIn() && isValidId(sessionId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && isValidId(sessionId)
+        && isValidStreamSession(incoming())
+        && incoming().status == 'live'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn()
+        && isValidId(sessionId)
+        && isValidStreamSession(incoming())
+        && existing().userId == request.auth.uid
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && existing().status != 'stopped'
+        && (
+          // Action: Stop active stream (Terminal state transition: live -> stopped)
+          (incoming().status == 'stopped' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          // Action: Update title while live
+          (incoming().status == 'live' && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'updatedAt']))
+        );
+
+      allow delete: if isSignedIn() && isValidId(sessionId) && existing().userId == request.auth.uid;
+    }
+  }
+}

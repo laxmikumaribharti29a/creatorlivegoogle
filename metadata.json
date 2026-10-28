@@ -1,0 +1,6 @@
+{
+  "name": "CreatorLive24/7",
+  "description": "24/7 Cloud & Browser Live Streaming Provider for YouTube, Facebook, and Custom RTMP — Patna, Bihar.",
+  "requestFramePermissions": ["camera", "microphone", "display-capture"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

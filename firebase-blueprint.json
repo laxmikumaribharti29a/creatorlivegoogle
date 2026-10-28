@@ -1,0 +1,176 @@
+{
+  "entities": {
+    "StreamKey": {
+      "title": "StreamKey",
+      "description": "Stores a user's RTMP stream destination configuration for YouTube, Facebook, or Custom RTMP.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "platform": {
+          "type": "string",
+          "description": "Streaming platform identifier",
+          "enum": ["youtube", "facebook", "custom"],
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "channelName": {
+          "type": "string",
+          "description": "Optional friendly channel label",
+          "minLength": 0,
+          "maxLength": 100
+        },
+        "streamKey": {
+          "type": "string",
+          "description": "RTMP stream key secret",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "rtmpUrl": {
+          "type": "string",
+          "description": "RTMP ingest server URL",
+          "minLength": 5,
+          "maxLength": 512
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether this destination is selected for broadcasting"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "userId",
+        "platform",
+        "channelName",
+        "streamKey",
+        "rtmpUrl",
+        "enabled",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StreamSession": {
+      "title": "StreamSession",
+      "description": "Represents a live broadcast or 24/7 cloud loop session created by a user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Stream broadcast title",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "sourceType": {
+          "type": "string",
+          "description": "Broadcast input source type",
+          "enum": ["camera", "screen", "video"],
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "videoFileName": {
+          "type": "string",
+          "description": "Uploaded video file display name",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "videoServerId": {
+          "type": "string",
+          "description": "Backend server job or uploaded file identifier",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "orientation": {
+          "type": "string",
+          "description": "Video aspect orientation",
+          "enum": ["landscape", "portrait"],
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "quality": {
+          "type": "string",
+          "description": "Broadcast resolution preset",
+          "enum": ["480p", "720p", "1080p"],
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "fps": {
+          "type": "number",
+          "description": "Frames per second (30 or 60)"
+        },
+        "loop247": {
+          "type": "boolean",
+          "description": "Whether server-side 24/7 infinite loop is active"
+        },
+        "status": {
+          "type": "string",
+          "description": "Current session state",
+          "enum": ["live", "stopped"],
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "destinations": {
+          "type": "string",
+          "description": "Summary of target platforms",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "userId",
+        "title",
+        "sourceType",
+        "videoFileName",
+        "videoServerId",
+        "orientation",
+        "quality",
+        "fps",
+        "loop247",
+        "status",
+        "destinations",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/streamKeys/{keyId}": {
+      "schema": { "$ref": "#/entities/StreamKey" },
+      "description": "User RTMP stream keys for YouTube, Facebook, and Custom RTMP."
+    },
+    "/streamSessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/StreamSession" },
+      "description": "User live streaming and 24/7 loop sessions."
+    }
+  }
+}
