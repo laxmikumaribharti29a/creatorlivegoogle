@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+.aistudio/artifacts/
+uploads/*.mp4
+uploads/*.webm
+uploads/*.mkv
+uploads/*.mov
+uploads/chunks/
+uploads/thumb_*
+

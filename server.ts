@@ -6,7 +6,14 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { spawn, execFile, ChildProcessWithoutNullStreams } from 'child_process';
-import { createServer as createViteServer } from 'vite';
+
+// Ensure working directory is always the repository root even if Hostinger starts from a subdirectory (e.g. .aistudio)
+if (
+  !fs.existsSync(path.resolve(process.cwd(), 'index.html')) &&
+  fs.existsSync(path.resolve(process.cwd(), '..', 'index.html'))
+) {
+  process.chdir(path.resolve(process.cwd(), '..'));
+}
 
 const PORT = Number(process.env.PORT) || 3000;
 const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
@@ -1876,14 +1883,26 @@ async function startServer() {
     });
   });
 
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+  const distPath = path.join(process.cwd(), 'dist');
+  const hasDistBuild = fs.existsSync(path.join(distPath, 'index.html'));
+
+  if (process.env.NODE_ENV !== 'production' && !process.env.HOSTINGER_PROD) {
+    try {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } catch {
+      if (hasDistBuild) {
+        app.use(express.static(distPath));
+        app.get('*', (_req, res) => {
+          res.sendFile(path.join(distPath, 'index.html'));
+        });
+      }
+    }
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));

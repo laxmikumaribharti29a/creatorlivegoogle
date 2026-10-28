@@ -1,0 +1,14 @@
+{
+  "name": "creatorlive247-hostinger-root-bridge",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "build": "cd .. && npm install --include=dev && npm run build && rm -rf ./dist && cp -r ../dist ./dist",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
