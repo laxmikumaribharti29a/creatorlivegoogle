@@ -16,6 +16,10 @@ import {
   EyeOff,
   LogOut,
   AlertCircle,
+  Download,
+  Copy,
+  Server,
+  FileCode,
 } from 'lucide-react';
 
 export interface ManagedUser {
@@ -122,7 +126,7 @@ export default function AdminPanel({
   const [loggingIn, setLoggingIn] = useState(false);
 
   const [adminTab, setAdminTab] = useState<
-    'overview' | 'users' | 'plans' | 'payments' | 'settings'
+    'overview' | 'users' | 'plans' | 'payments' | 'settings' | 'hostinger'
   >('settings');
 
   // Users search & add state
@@ -151,6 +155,28 @@ export default function AdminPanel({
   );
   const [showNewAdminPassword, setShowNewAdminPassword] = useState(false);
   const [savingCredentials, setSavingCredentials] = useState(false);
+
+  // Environment Variables (.env) & Hostinger Deployment State
+  const [envText, setEnvText] = useState<string>('');
+  const [savingEnv, setSavingEnv] = useState<boolean>(false);
+  const envFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const fetchHostingerEnv = async () => {
+    try {
+      const res = await fetch('/api/admin/env');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.envContent) {
+        setEnvText(data.envContent);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    fetchHostingerEnv();
+  }, []);
 
   useEffect(() => {
     setFormSettings(initialSettings);
@@ -288,11 +314,78 @@ export default function AdminPanel({
       });
       if (res.ok) {
         await onRefreshAdminData();
+        await fetchHostingerEnv();
         showToast('Admin Login Email & Password updated successfully!');
       }
     } finally {
       setSavingCredentials(false);
     }
+  };
+
+  // Download .env file for Hostinger deployment
+  const handleDownloadEnvFile = (fileName = '.env') => {
+    const content = envText.trim() || '# CreatorLive24/7 Hostinger .env\nNODE_ENV="production"\nPORT="3000"\n';
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(`Downloaded ${fileName} for Hostinger deployment!`);
+  };
+
+  // Copy .env content to clipboard
+  const handleCopyEnvText = async () => {
+    try {
+      await navigator.clipboard.writeText(envText);
+      showToast('Copied all .env Environment Variables to clipboard!');
+    } catch {
+      showToast('Could not copy automatically — please select and copy from the box.');
+    }
+  };
+
+  // Import / Save edited .env content to Server
+  const handleSaveAndImportEnv = async (customContent?: string) => {
+    const payloadText = customContent !== undefined ? customContent : envText;
+    if (!payloadText.trim()) return;
+    setSavingEnv(true);
+    try {
+      const res = await fetch('/api/admin/env/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ envContent: payloadText }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (data.envContent) setEnvText(data.envContent);
+        await onRefreshAdminData();
+        showToast(`Imported & applied ${data.parsedCount || ''} Environment Variables (.env)!`);
+      } else {
+        showToast(data.error || 'Failed to import .env file.');
+      }
+    } catch {
+      showToast('Failed to import .env variables.');
+    } finally {
+      setSavingEnv(false);
+    }
+  };
+
+  // Upload a .env file from device to import
+  const handleImportEnvFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      if (typeof reader.result === 'string') {
+        setEnvText(reader.result);
+        await handleSaveAndImportEnv(reader.result);
+      }
+    };
+    reader.readAsText(file);
+    if (envFileInputRef.current) envFileInputRef.current.value = '';
   };
 
   // Admin Login Submit
@@ -462,7 +555,15 @@ export default function AdminPanel({
             Manage {formSettings.websiteName || 'CreatorLive24/7'}
           </h1>
         </div>
-        <div className="flex items-center gap-2 self-start sm:self-auto">
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+          <button
+            type="button"
+            onClick={() => handleDownloadEnvFile('.env')}
+            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-full bg-emerald-600 hover:bg-emerald-700 text-xs font-bold text-white transition-colors cursor-pointer"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Download .env (Hostinger)</span>
+          </button>
           <button
             type="button"
             onClick={onBackToSite}
@@ -538,6 +639,18 @@ export default function AdminPanel({
           }`}
         >
           Main Page Settings
+        </button>
+        <button
+          type="button"
+          onClick={() => setAdminTab('hostinger')}
+          className={`px-4 py-2 rounded-full text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
+            adminTab === 'hostinger'
+              ? 'bg-[#0f172a] text-white font-bold'
+              : 'text-emerald-700 hover:text-emerald-900'
+          }`}
+        >
+          <Server className="w-3.5 h-3.5" />
+          <span>Hostinger &amp; .env</span>
         </button>
       </div>
 
@@ -1443,6 +1556,81 @@ export default function AdminPanel({
             </div>
           </div>
 
+          {/* Card 7: Environment Variables (.env) Download & Import for Hostinger */}
+          <div className="bg-white rounded-[24px] border border-slate-200 p-6 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <FileCode className="w-4 h-4 text-emerald-600" />
+                  <h2 className="text-sm font-bold text-slate-900">
+                    Environment Variables (.env) — Download &amp; Import for Hostinger
+                  </h2>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Download your ready-to-use <code className="font-mono font-bold text-slate-700">.env</code> file for Hostinger deployment, or import an existing <code className="font-mono font-bold text-slate-700">.env</code> file.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  ref={envFileInputRef}
+                  type="file"
+                  accept=".env,text/plain"
+                  onChange={handleImportEnvFileUpload}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => envFileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Import .env File</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleCopyEnvText}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Copy .env</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleDownloadEnvFile('.env')}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download .env</span>
+                </button>
+              </div>
+            </div>
+
+            <textarea
+              rows={10}
+              value={envText}
+              onChange={(e) => setEnvText(e.target.value)}
+              className="w-full p-3.5 text-xs font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-slate-400"
+              placeholder="# Environment variables (.env)"
+            />
+
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[11px] text-slate-500">
+                Tip: Edit any variable above and click <strong>Apply &amp; Save .env</strong>, or click <strong>Download .env</strong> to upload to Hostinger.
+              </span>
+              <button
+                type="button"
+                disabled={savingEnv}
+                onClick={() => handleSaveAndImportEnv()}
+                className="px-4 py-2 rounded-xl bg-[#0f172a] hover:bg-slate-800 text-white text-xs font-bold transition-colors cursor-pointer"
+              >
+                {savingEnv ? 'Applying...' : 'Apply & Save .env'}
+              </button>
+            </div>
+          </div>
+
           {/* Save settings red button */}
           <div>
             <button
@@ -1454,6 +1642,134 @@ export default function AdminPanel({
             </button>
           </div>
         </form>
+      )}
+
+      {/* ==================== TAB 6: HOSTINGER & .ENV DEPLOYMENT ==================== */}
+      {adminTab === 'hostinger' && (
+        <div className="space-y-6">
+          <div className="bg-white rounded-[24px] border border-slate-200 p-6 space-y-5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-bold mb-2">
+                  <Server className="w-3.5 h-3.5" />
+                  <span>HOSTINGER READY</span>
+                </span>
+                <h2 className="text-xl font-black text-slate-900">
+                  Environment Variables (<code className="font-mono text-emerald-700">.env</code>) &amp; Hostinger Deployment
+                </h2>
+                <p className="text-xs text-slate-500 mt-1">
+                  Download the <code className="font-mono font-bold">.env</code> file or import your custom <code className="font-mono font-bold">.env</code> variables to deploy CreatorLive24/7 on Hostinger VPS or Hostinger Node.js Web App.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => envFileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Import .env File</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleCopyEnvText}
+                  className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Copy Variables</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleDownloadEnvFile('.env')}
+                  className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs transition-colors cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Download .env File</span>
+                </button>
+              </div>
+            </div>
+
+            <textarea
+              rows={16}
+              value={envText}
+              onChange={(e) => setEnvText(e.target.value)}
+              className="w-full p-4 text-xs font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded-2xl focus:outline-none focus:border-slate-400"
+            />
+
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <a
+                  href="/api/admin/env/download?filename=.env"
+                  download=".env"
+                  className="text-xs font-bold text-emerald-700 hover:underline"
+                >
+                  Direct Server Download (.env)
+                </a>
+                <span className="text-slate-300">·</span>
+                <button
+                  type="button"
+                  onClick={() => handleDownloadEnvFile('hostinger.env.txt')}
+                  className="text-xs font-bold text-slate-600 hover:underline cursor-pointer"
+                >
+                  Download as hostinger.env.txt
+                </button>
+              </div>
+
+              <button
+                type="button"
+                disabled={savingEnv}
+                onClick={() => handleSaveAndImportEnv()}
+                className="px-5 py-2.5 rounded-xl bg-[#0f172a] hover:bg-slate-800 text-white text-xs font-bold transition-colors cursor-pointer"
+              >
+                {savingEnv ? 'Applying...' : 'Save & Apply .env Variables'}
+              </button>
+            </div>
+          </div>
+
+          {/* Step-by-Step Hostinger Deployment Instructions */}
+          <div className="bg-white rounded-[24px] border border-slate-200 p-6 space-y-4">
+            <h3 className="text-base font-bold text-slate-900">
+              How to Deploy CreatorLive24/7 on Hostinger (Step-by-Step)
+            </h3>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-600">
+              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-2">
+                <p className="font-bold text-slate-900 text-sm">
+                  Option A: Hostinger hPanel (Node.js Web App / GitHub)
+                </p>
+                <ol className="list-decimal list-inside space-y-1.5 leading-relaxed">
+                  <li>Click <strong>Download .env File</strong> above or <strong>Copy Variables</strong>.</li>
+                  <li>In Hostinger hPanel, open <strong>Websites → Node.js</strong> (Node v20+ or v22).</li>
+                  <li>Upload your project ZIP or connect your GitHub repository.</li>
+                  <li>In Hostinger <strong>Environment Variables</strong>, import the downloaded <code className="font-mono font-bold">.env</code> file (or paste the variables).</li>
+                  <li>Set Build command: <code className="font-mono bg-white px-1.5 py-0.5 rounded border">npm run build</code></li>
+                  <li>Set Start command: <code className="font-mono bg-white px-1.5 py-0.5 rounded border">npm start</code> and Port: <code className="font-mono bg-white px-1.5 py-0.5 rounded border">3000</code>.</li>
+                </ol>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-2">
+                <p className="font-bold text-slate-900 text-sm">
+                  Option B: Hostinger KVM VPS (Recommended for 24/7 FFmpeg Loop)
+                </p>
+                <p className="text-slate-500">
+                  Run these commands on your Hostinger Ubuntu VPS terminal:
+                </p>
+                <pre className="p-3 rounded-xl bg-slate-900 text-emerald-400 font-mono text-[11px] overflow-x-auto leading-relaxed">
+{`sudo apt update && sudo apt install -y ffmpeg nodejs npm
+npm install
+# Upload your downloaded .env file to the project folder
+npm run build
+sudo npm install -g pm2
+pm2 start npm --name "creatorlive247" -- start
+pm2 save && pm2 startup`}
+                </pre>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

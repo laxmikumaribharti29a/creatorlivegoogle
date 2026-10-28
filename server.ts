@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -7,11 +8,12 @@ import fs from 'fs';
 import { spawn, execFile, ChildProcessWithoutNullStreams } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
 const CHUNKS_DIR = path.join(UPLOADS_DIR, 'chunks');
 const CATALOG_FILE = path.join(UPLOADS_DIR, 'videos-index.json');
 const ADMIN_DATA_FILE = path.join(UPLOADS_DIR, 'admin-data.json');
+const CUSTOM_ENV_FILE = path.join(UPLOADS_DIR, 'hostinger.env');
 
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -684,6 +686,130 @@ async function startServer() {
       updated: true,
       adminEmail: adminStore.settings.adminEmail,
       settings: adminStore.settings,
+    });
+  });
+
+  // Build ready-to-deploy .env content for Hostinger (VPS / Node.js Hosting)
+  function buildHostingerEnvContent(): string {
+    let fbConfig: Record<string, string> = {};
+    try {
+      const fbPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+      if (fs.existsSync(fbPath)) {
+        fbConfig = JSON.parse(fs.readFileSync(fbPath, 'utf-8'));
+      }
+    } catch {
+      // ignore
+    }
+
+    const s = adminStore.settings;
+    const lines = [
+      '# ============================================================================',
+      '# CreatorLive24/7 — Production Environment Variables (.env) for Hostinger',
+      '# Address: Patna, Bihar, India | Website: https://creatorlive247.com',
+      '# ============================================================================',
+      '',
+      '# 1. Server & Hostinger Node.js Runtime Configuration',
+      'NODE_ENV="production"',
+      `PORT="${PORT}"`,
+      `APP_URL="${process.env.APP_URL || 'https://creatorlive247.com'}"`,
+      '',
+      '# 2. Website & Admin Panel Credentials',
+      `WEBSITE_NAME="${s.websiteName || 'CreatorLive24/7'}"`,
+      `WEBSITE_TAGLINE="${s.tagline || 'Your Content. Always On.'}"`,
+      `BUSINESS_ADDRESS="${s.businessAddress || 'Patna, Bihar'}"`,
+      `ADMIN_EMAIL="${s.adminEmail || 'typing.classes@gmail.com'}"`,
+      `ADMIN_PASSWORD="${s.adminPassword || 'admin123'}"`,
+      `SUPPORT_MOBILE="${s.mobileNumber || '+918863090950'}"`,
+      `SUPPORT_WHATSAPP="${s.whatsappNumber || '+918863090950'}"`,
+      `SUPPORT_EMAIL="${s.supportEmail || 'typing.classes@gmail.com'}"`,
+      `UPI_ID="${s.upiId || 'creatorlive247@upi'}"`,
+      `UPI_PAYEE_NAME="${s.upiPayeeName || 'CreatorLive24/7'}"`,
+      '',
+      '# 3. 24/7 Live Streaming RTMPS Endpoints (Port 443 TLS)',
+      'YOUTUBE_RTMPS_URL="rtmps://a.rtmps.youtube.com:443/live2"',
+      'FACEBOOK_RTMPS_URL="rtmps://live-api-s.facebook.com:443/rtmp"',
+      '',
+      '# 4. Firebase & Google Login Configuration (Vite Client + Server)',
+      `VITE_FIREBASE_PROJECT_ID="${fbConfig.projectId || 'gen-lang-client-0175387127'}"`,
+      `VITE_FIREBASE_APP_ID="${fbConfig.appId || '1:770962182906:web:47fba6dee7b83579242f43'}"`,
+      `VITE_FIREBASE_API_KEY="${fbConfig.apiKey || ''}"`,
+      `VITE_FIREBASE_AUTH_DOMAIN="${fbConfig.authDomain || 'gen-lang-client-0175387127.firebaseapp.com'}"`,
+      `VITE_FIREBASE_FIRESTORE_DATABASE_ID="${fbConfig.firestoreDatabaseId || 'ai-studio-creatorlive247-e9053ccc-a48f-4777-a848-fe4ba1977fc4'}"`,
+      `VITE_FIREBASE_STORAGE_BUCKET="${fbConfig.storageBucket || 'gen-lang-client-0175387127.firebasestorage.app'}"`,
+      `VITE_FIREBASE_MESSAGING_SENDER_ID="${fbConfig.messagingSenderId || '770962182906'}"`,
+      `VITE_GOOGLE_OAUTH_CLIENT_ID="${fbConfig.oAuthClientId || ''}"`,
+      '',
+    ];
+    return lines.join('\n');
+  }
+
+  // Get .env content for Hostinger deployment
+  app.get('/api/admin/env', (_req, res) => {
+    const envContent = buildHostingerEnvContent();
+    res.json({ envContent });
+  });
+
+  // Direct file download of .env for Hostinger deployment
+  app.get('/api/admin/env/download', (_req, res) => {
+    const envContent = buildHostingerEnvContent();
+    const filename = (_req.query.filename as string) || '.env';
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(envContent);
+  });
+
+  // Import / Save .env file content and sync into Admin Settings
+  app.post('/api/admin/env/import', (req, res) => {
+    const { envContent } = req.body || {};
+    if (!envContent || typeof envContent !== 'string') {
+      res.status(400).json({ error: 'Valid .env content is required.' });
+      return;
+    }
+
+    const parsedVars: Record<string, string> = {};
+    const lines = envContent.split(/\r?\n/);
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIdx = line.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = line.slice(0, eqIdx).trim();
+      let val = line.slice(eqIdx + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      if (key) {
+        parsedVars[key] = val;
+      }
+    }
+
+    if (parsedVars.WEBSITE_NAME) adminStore.settings.websiteName = parsedVars.WEBSITE_NAME;
+    if (parsedVars.WEBSITE_TAGLINE) adminStore.settings.tagline = parsedVars.WEBSITE_TAGLINE;
+    if (parsedVars.BUSINESS_ADDRESS) adminStore.settings.businessAddress = parsedVars.BUSINESS_ADDRESS;
+    if (parsedVars.ADMIN_EMAIL) adminStore.settings.adminEmail = parsedVars.ADMIN_EMAIL;
+    if (parsedVars.ADMIN_PASSWORD) adminStore.settings.adminPassword = parsedVars.ADMIN_PASSWORD;
+    if (parsedVars.SUPPORT_MOBILE) adminStore.settings.mobileNumber = parsedVars.SUPPORT_MOBILE;
+    if (parsedVars.SUPPORT_WHATSAPP) adminStore.settings.whatsappNumber = parsedVars.SUPPORT_WHATSAPP;
+    if (parsedVars.SUPPORT_EMAIL) adminStore.settings.supportEmail = parsedVars.SUPPORT_EMAIL;
+    if (parsedVars.UPI_ID) adminStore.settings.upiId = parsedVars.UPI_ID;
+    if (parsedVars.UPI_PAYEE_NAME) adminStore.settings.upiPayeeName = parsedVars.UPI_PAYEE_NAME;
+
+    saveAdminStore();
+
+    try {
+      fs.writeFileSync(CUSTOM_ENV_FILE, envContent, 'utf-8');
+    } catch {
+      // ignore
+    }
+
+    res.json({
+      imported: true,
+      parsedCount: Object.keys(parsedVars).length,
+      settings: adminStore.settings,
+      envContent: buildHostingerEnvContent(),
     });
   });
 
