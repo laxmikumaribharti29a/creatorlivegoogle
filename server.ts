@@ -424,10 +424,22 @@ function loadCatalog() {
   }
 }
 
-function probeVideoFile(filePath: string): Promise<{ hasAudio: boolean; durationSec: number }> {
+function probeVideoFile(
+  filePath: string
+): Promise<{ isValid: boolean; hasAudio: boolean; durationSec: number }> {
   return new Promise((resolve) => {
     try {
-      const proc = spawn(FFMPEG_BIN, ['-hide_banner', '-i', filePath]);
+      if (!fs.existsSync(filePath)) {
+        resolve({ isValid: false, hasAudio: false, durationSec: 0 });
+        return;
+      }
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile() || stat.size < 4096) {
+        resolve({ isValid: false, hasAudio: false, durationSec: 0 });
+        return;
+      }
+
+      const proc = spawn(FFMPEG_BIN, ['-nostdin', '-hide_banner', '-i', filePath]);
       let stderr = '';
       const timer = setTimeout(() => {
         try {
@@ -435,7 +447,7 @@ function probeVideoFile(filePath: string): Promise<{ hasAudio: boolean; duration
         } catch {
           // ignore
         }
-        resolve({ hasAudio: false, durationSec: 0 });
+        resolve({ isValid: true, hasAudio: false, durationSec: 0 });
       }, 8000);
 
       proc.stderr.on('data', (chunk: Buffer) => {
@@ -444,6 +456,11 @@ function probeVideoFile(filePath: string): Promise<{ hasAudio: boolean; duration
 
       proc.on('close', () => {
         clearTimeout(timer);
+        const hasVideo = /Stream #\d+:\d+.*Video:/i.test(stderr);
+        const hasCorruptError =
+          /moov atom not found|Invalid data found when processing input|End of file/i.test(
+            stderr
+          ) && !hasVideo;
         const hasAudio = /Stream #\d+:\d+.*Audio:/i.test(stderr);
         let durationSec = 0;
         const durMatch = stderr.match(/Duration:\s*(\d+):(\d+):([\d.]+)/i);
@@ -453,31 +470,42 @@ function probeVideoFile(filePath: string): Promise<{ hasAudio: boolean; duration
             parseInt(durMatch[2], 10) * 60 +
             parseFloat(durMatch[3]);
         }
-        resolve({ hasAudio, durationSec });
+        resolve({
+          isValid: hasVideo && !hasCorruptError,
+          hasAudio,
+          durationSec,
+        });
       });
 
       proc.on('error', () => {
         clearTimeout(timer);
-        resolve({ hasAudio: false, durationSec: 0 });
+        resolve({ isValid: false, hasAudio: false, durationSec: 0 });
       });
     } catch {
-      resolve({ hasAudio: false, durationSec: 0 });
+      resolve({ isValid: false, hasAudio: false, durationSec: 0 });
     }
   });
 }
 
-function ensureSampleVideo(): Promise<UploadedVideoFile> {
+async function ensureSampleVideo(): Promise<UploadedVideoFile> {
   const sampleId = 'sample_reelshorts_24_7';
-  const existing = uploadedVideos.get(sampleId);
-  if (existing && fs.existsSync(existing.filePath)) {
-    return Promise.resolve(existing);
-  }
-
   const fileName = 'sample_creatorlive_247.mp4';
   const filePath = path.join(UPLOADS_DIR, fileName);
+  const bundledAssetPath = path.resolve(
+    process.cwd(),
+    'public/assets/sample_creatorlive_247.mp4'
+  );
 
-  return new Promise((resolve, reject) => {
-    if (fs.existsSync(filePath)) {
+  // Remove any stale duplicate sample entries
+  for (const [id, item] of uploadedVideos.entries()) {
+    if (item.fileName === fileName && id !== sampleId) {
+      uploadedVideos.delete(id);
+    }
+  }
+
+  if (fs.existsSync(filePath)) {
+    const probe = await probeVideoFile(filePath);
+    if (probe.isValid) {
       const stats = fs.statSync(filePath);
       const item: UploadedVideoFile = {
         id: sampleId,
@@ -485,27 +513,77 @@ function ensureSampleVideo(): Promise<UploadedVideoFile> {
         fileName,
         filePath,
         sizeBytes: stats.size,
-        hasAudio: true,
-        durationSec: 6,
+        hasAudio: probe.hasAudio,
+        durationSec: probe.durationSec || 6,
         createdAt: Date.now(),
       };
       uploadedVideos.set(sampleId, item);
       saveCatalog();
-      return resolve(item);
+      return item;
+    } else {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // ignore
+      }
     }
+  }
 
+  // Copy pre-built valid faststart MP4 from public/assets if available
+  if (fs.existsSync(bundledAssetPath)) {
+    try {
+      fs.copyFileSync(bundledAssetPath, filePath);
+      const stats = fs.statSync(filePath);
+      if (stats.size > 50000) {
+        const item: UploadedVideoFile = {
+          id: sampleId,
+          originalName: '20_30_की_उम्र_में_अमीर_बनने_का_रहस्य_reelshorts.mp4',
+          fileName,
+          filePath,
+          sizeBytes: stats.size,
+          hasAudio: true,
+          durationSec: 6,
+          createdAt: Date.now(),
+        };
+        uploadedVideos.set(sampleId, item);
+        saveCatalog();
+        return item;
+      }
+    } catch {
+      // fallback to FFmpeg generation below
+    }
+  }
+
+  return new Promise((resolve, reject) => {
     const ff = spawn(FFMPEG_BIN, [
+      '-nostdin',
       '-y',
-      '-f', 'lavfi',
-      '-i', 'testsrc2=size=720x1280:rate=30:duration=6',
-      '-f', 'lavfi',
-      '-i', 'sine=frequency=440:sample_rate=44100:duration=6',
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-pix_fmt', 'yuv420p',
-      '-b:v', '1000k',
-      '-c:a', 'aac',
-      '-b:a', '128k',
+      '-filter_threads',
+      '1',
+      '-f',
+      'lavfi',
+      '-i',
+      'testsrc2=size=720x1280:rate=30:duration=6',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=440:sample_rate=44100:duration=6',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-threads',
+      '2',
+      '-pix_fmt',
+      'yuv420p',
+      '-b:v',
+      '1000k',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-movflags',
+      '+faststart',
       filePath,
     ]);
 
@@ -537,23 +615,18 @@ function buildFullRtmpUrl(
   rtmpUrl: string,
   streamKey: string,
   platform?: string,
-  usePlainRtmpForYoutube = false
+  useBackupYoutubeServer = false
 ): string {
   const cleanKey = streamKey.trim();
+  const ytBase = useBackupYoutubeServer
+    ? 'rtmps://b.rtmps.youtube.com:443/live2'
+    : 'rtmps://a.rtmps.youtube.com:443/live2';
+
   if (cleanKey.startsWith('rtmp://') || cleanKey.startsWith('rtmps://')) {
     if (cleanKey.includes('youtube.com')) {
-      if (usePlainRtmpForYoutube) {
-        return cleanKey.replace(
-          /^rtmps:\/\/([ab])\.rtmps\.youtube\.com(?::443)?\/live2/i,
-          'rtmp://$1.rtmp.youtube.com/live2'
-        );
-      }
-      if (cleanKey.startsWith('rtmp://')) {
-        return cleanKey
-          .replace(/^rtmp:\/\/a\.rtmp\.youtube\.com\/live2/i, 'rtmps://a.rtmps.youtube.com:443/live2')
-          .replace(/^rtmp:\/\/b\.rtmp\.youtube\.com\/live2/i, 'rtmps://b.rtmps.youtube.com:443/live2')
-          .replace(/^rtmp:\/\/([^/]+)\/live2/i, 'rtmps://a.rtmps.youtube.com:443/live2');
-      }
+      return cleanKey
+        .replace(/^rtmps?:\/\/[ab]\.rtmps?\.youtube\.com(?::\d+)?\/live2/i, ytBase)
+        .replace(/^rtmp:\/\/([^/]+)\/live2/i, ytBase);
     }
     return cleanKey;
   }
@@ -569,21 +642,15 @@ function buildFullRtmpUrl(
   if (isFacebookKey) {
     base = 'rtmps://live-api-s.facebook.com:443/rtmp';
   } else if (isYoutubePattern || platform === 'youtube') {
-    base = usePlainRtmpForYoutube
-      ? 'rtmp://a.rtmp.youtube.com/live2'
-      : 'rtmps://a.rtmps.youtube.com:443/live2';
+    base = ytBase;
   } else if (!base) {
     if (platform === 'facebook') {
       base = 'rtmps://live-api-s.facebook.com:443/rtmp';
     } else {
-      base = usePlainRtmpForYoutube
-        ? 'rtmp://a.rtmp.youtube.com/live2'
-        : 'rtmps://a.rtmps.youtube.com:443/live2';
+      base = ytBase;
     }
   } else if (base.includes('youtube.com')) {
-    base = usePlainRtmpForYoutube
-      ? 'rtmp://a.rtmp.youtube.com/live2'
-      : 'rtmps://a.rtmps.youtube.com:443/live2';
+    base = ytBase;
   }
 
   const trimmedKey = cleanKey.replace(/^\/+/, '');
@@ -711,7 +778,7 @@ function parseFfmpegStats(chunkStr: string, job: ServerStreamJob, platformLabel:
     const frameMatch = line.match(/frame=\s*(\d+)/);
     if (frameMatch) {
       job.framesSent = parseInt(frameMatch[1], 10);
-      if (job.framesSent > 10 && job.errorMessage) {
+      if (job.framesSent > 0 && job.errorMessage) {
         job.errorMessage = undefined;
       }
     }
@@ -727,8 +794,10 @@ function parseFfmpegStats(chunkStr: string, job: ServerStreamJob, platformLabel:
       line.includes('Server returned') ||
       line.includes('Connection timed out')
     ) {
-      job.errorMessage = `[${platformLabel}] ${line.trim().slice(0, 180)}`;
-      job.lastLog = job.errorMessage;
+      if (job.framesSent === 0) {
+        job.errorMessage = `[${platformLabel}] ${line.trim().slice(0, 180)}`;
+        job.lastLog = job.errorMessage;
+      }
     } else if (line.includes('frame=') || line.includes('Output #0')) {
       job.lastLog = `[${platformLabel}] ${line.trim().slice(0, 180)}`;
     }
@@ -779,6 +848,25 @@ async function startServer() {
 
   app.use(express.json({ limit: '25mb' }));
   app.use('/uploads', express.static(UPLOADS_DIR));
+  // Fallback if an uploaded file was cleared on container redeploy so the <video> player never shows 0:00 black screen
+  app.use('/uploads', (_req, res) => {
+    const candidates = [
+      path.join(UPLOADS_DIR, 'sample_creatorlive_247.mp4'),
+      path.join(__dirname, 'public', 'assets', 'sample_creatorlive_247.mp4'),
+      path.join(__dirname, 'dist', 'assets', 'sample_creatorlive_247.mp4'),
+    ];
+    for (const candidate of candidates) {
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).size > 4096) {
+          res.sendFile(candidate);
+          return;
+        }
+      } catch {
+        // continue
+      }
+    }
+    res.status(404).end();
+  });
 
   // ==================== ADMIN & SITE CONFIG API ====================
   app.get('/api/admin/data', (_req, res) => {
@@ -1169,10 +1257,22 @@ async function startServer() {
 
   // ==================== VIDEOS & CHUNKED UPLOAD API ====================
   app.get('/api/videos', async (_req, res) => {
-    let list = Array.from(uploadedVideos.values()).filter((v) => fs.existsSync(v.filePath));
+    let list = Array.from(uploadedVideos.values()).filter((v) => {
+      try {
+        return fs.existsSync(v.filePath) && fs.statSync(v.filePath).size > 4096;
+      } catch {
+        return false;
+      }
+    });
     if (list.length === 0) {
       await ensureSampleVideo().catch(() => null);
-      list = Array.from(uploadedVideos.values()).filter((v) => fs.existsSync(v.filePath));
+      list = Array.from(uploadedVideos.values()).filter((v) => {
+        try {
+          return fs.existsSync(v.filePath) && fs.statSync(v.filePath).size > 4096;
+        } catch {
+          return false;
+        }
+      });
     }
     const mapped = list
       .sort((a, b) => b.createdAt - a.createdAt)
@@ -1215,9 +1315,21 @@ async function startServer() {
         const finalFilePath = path.join(UPLOADS_DIR, finalFileName);
 
         fs.renameSync(tempFilePath, finalFilePath);
-        const stats = fs.statSync(finalFilePath);
         const probe = await probeVideoFile(finalFilePath);
+        if (!probe.isValid) {
+          try {
+            fs.unlinkSync(finalFilePath);
+          } catch {
+            // ignore
+          }
+          res.status(400).json({
+            error:
+              'Uploaded video file is corrupt or incomplete (missing MP4 moov header). Please upload a valid MP4 video.',
+          });
+          return;
+        }
 
+        const stats = fs.statSync(finalFilePath);
         const item: UploadedVideoFile = {
           id: finalId,
           originalName: originalName || finalFileName,
@@ -1309,16 +1421,19 @@ async function startServer() {
       await new Promise<void>((resolve, reject) => {
         const ff = spawn(FFMPEG_BIN, [
           '-y',
+          '-filter_threads', '1',
           '-f', 'lavfi',
           '-i', `color=c=0x${bgHex.replace('#', '')}:s=${sizeStr}:r=30:d=${safeDuration}`,
           '-f', 'lavfi',
           '-i', `sine=frequency=528:sample_rate=44100:duration=${safeDuration}`,
+          '-threads', '2',
           '-c:v', 'libx264',
           '-preset', 'ultrafast',
           '-pix_fmt', 'yuv420p',
           '-b:v', '1200k',
           '-c:a', 'aac',
           '-b:a', '128k',
+          '-movflags', '+faststart',
           filePath,
         ]);
         ff.on('close', (code) =>
@@ -1474,6 +1589,24 @@ async function startServer() {
         uploadedVideos.get(videoId) ||
         Array.from(uploadedVideos.values()).find((v) => fs.existsSync(v.filePath));
 
+      if (video && fs.existsSync(video.filePath)) {
+        const checkProbe = await probeVideoFile(video.filePath);
+        if (!checkProbe.isValid) {
+          // Corrupt or truncated video file on disk (would cause FFmpeg code 183): remove and fall back to valid sample
+          try {
+            fs.unlinkSync(video.filePath);
+          } catch {
+            // ignore
+          }
+          uploadedVideos.delete(video.id);
+          saveCatalog();
+          video = undefined;
+        } else {
+          video.hasAudio = checkProbe.hasAudio;
+          video.durationSec = checkProbe.durationSec;
+        }
+      }
+
       if (!video || !fs.existsSync(video.filePath)) {
         const fallbackSample = await ensureSampleVideo().catch(() => null);
         if (fallbackSample && fs.existsSync(fallbackSample.filePath)) {
@@ -1503,11 +1636,6 @@ async function startServer() {
           activeJobs.delete(oldId);
         }
       }
-
-      // Always probe audio track before streaming so YouTube Live always receives a valid audio stream
-      const probe = await probeVideoFile(video.filePath);
-      video.hasAudio = probe.hasAudio;
-      video.durationSec = probe.durationSec;
 
       const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       const { width, height, videoBitrate } = getResolutionArgs(quality, orientation);
@@ -1546,13 +1674,13 @@ async function startServer() {
           dest.streamKey === 'FB-3948102948eQ-7' ||
           dest.streamKey.startsWith('demo_');
 
-        // Alternate between RTMPS (:443) and standard RTMP (:1935) on retry so both Cloud Run and Hostinger containers work seamlessly
-        const usePlainRtmp = retryCount % 2 === 1;
+        // Alternate between primary (a.rtmps.youtube.com:443) and backup (b.rtmps.youtube.com:443) on retry
+        const useBackupYoutube = retryCount % 2 === 1;
         const fullRtmp = buildFullRtmpUrl(
           dest.rtmpUrl,
           dest.streamKey,
           dest.platform,
-          usePlainRtmp
+          useBackupYoutube
         );
 
         let bridge: { localRtmpUrl: string; tcUrl: string; close: () => void } | null = null;
@@ -1576,10 +1704,14 @@ async function startServer() {
           '-hide_banner',
           '-loglevel',
           'info',
+          '-filter_threads',
+          '1',
+          '-filter_complex_threads',
+          '1',
           '-fflags',
           '+genpts+igndts+discardcorrupt',
           '-thread_queue_size',
-          '4096',
+          '2048',
         ];
         if (loop247) {
           args.push('-stream_loop', '-1');
@@ -1591,7 +1723,7 @@ async function startServer() {
         if (!video.hasAudio) {
           args.push(
             '-thread_queue_size',
-            '4096',
+            '2048',
             '-f',
             'lavfi',
             '-i',
@@ -1601,13 +1733,13 @@ async function startServer() {
         }
 
         let thumbInputIdx = -1;
-        if (thumbFilePath && fs.existsSync(thumbFilePath)) {
+        if (retryCount === 0 && thumbFilePath && fs.existsSync(thumbFilePath)) {
           args.push('-i', thumbFilePath);
           thumbInputIdx = nextInputIdx++;
         }
 
         let logoInputIdx = -1;
-        if (logoFilePath && fs.existsSync(logoFilePath)) {
+        if (retryCount <= 1 && logoFilePath && fs.existsSync(logoFilePath)) {
           args.push('-i', logoFilePath);
           logoInputIdx = nextInputIdx++;
         }
@@ -1663,7 +1795,7 @@ async function startServer() {
           '-tune',
           'zerolatency',
           '-threads',
-          '0',
+          '2',
           '-b:v',
           videoBitrate,
           '-minrate',
@@ -1673,7 +1805,7 @@ async function startServer() {
           '-bufsize',
           bufSizeK,
           '-x264-params',
-          'nal-hrd=cbr:force-cfr=1',
+          'nal-hrd=cbr:force-cfr=1:threads=2:lookahead-threads=1',
           '-pix_fmt',
           'yuv420p',
           '-g',
@@ -1691,7 +1823,7 @@ async function startServer() {
           '-ac',
           '2',
           '-max_muxing_queue_size',
-          '4096'
+          '2048'
         );
 
         if (!loop247 && !video.hasAudio) {
@@ -1742,11 +1874,11 @@ async function startServer() {
           if (job.status === 'live' && code !== 0) {
             if (retryCount < 6) {
               job.errorMessage = undefined;
-              job.lastLog = `[${label}] Switching RTMP/RTMPS transport & reconnecting stream (attempt ${retryCount + 1})...`;
+              job.lastLog = `[${label}] Reconnecting live stream (attempt ${retryCount + 1})...`;
               setTimeout(() => {
                 void spawnDestinationProcess(dest, retryCount + 1);
               }, 1000);
-            } else {
+            } else if (job.framesSent === 0) {
               job.errorMessage = `RTMP Server (${label}) closed connection (code ${code}). Verify your ${label} Stream Key is active and Live Studio is ready.`;
               job.lastLog = job.errorMessage;
             }
@@ -1907,14 +2039,18 @@ async function startServer() {
         '-hide_banner',
         '-loglevel',
         'info',
+        '-filter_threads',
+        '1',
+        '-filter_complex_threads',
+        '1',
         '-fflags',
         '+genpts+igndts+discardcorrupt',
         '-thread_queue_size',
-        '4096',
+        '512',
         '-i',
         'pipe:0',
         '-thread_queue_size',
-        '4096',
+        '512',
         '-f',
         'lavfi',
         '-i',
@@ -1982,7 +2118,7 @@ async function startServer() {
         '-tune',
         'zerolatency',
         '-threads',
-        '0',
+        '2',
         '-b:v',
         videoBitrate,
         '-minrate',
@@ -1992,7 +2128,7 @@ async function startServer() {
         '-bufsize',
         bufSizeK,
         '-x264-params',
-        'nal-hrd=cbr:force-cfr=1',
+        'nal-hrd=cbr:force-cfr=1:threads=2:lookahead-threads=1',
         '-pix_fmt',
         'yuv420p',
         '-g',

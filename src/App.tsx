@@ -127,7 +127,7 @@ const INITIAL_DEMO_KEYS: StreamKeyRecord[] = [
     channelName: 'Facebook',
     streamKey: 'FB-3948102948eQ-7',
     rtmpUrl: 'rtmps://live-api-s.facebook.com:443/rtmp',
-    enabled: true,
+    enabled: false,
   },
 ];
 
@@ -150,6 +150,9 @@ const DEFAULT_SITE_SETTINGS: MainPageSettings = {
 };
 
 function normalizeStreamKeyRecord(item: StreamKeyRecord): StreamKeyRecord {
+  if (item.id === 'demo_fb_1' || item.streamKey === 'FB-3948102948eQ-7') {
+    return { ...item, enabled: false };
+  }
   if (
     item.platform === 'youtube' ||
     (item.rtmpUrl && item.rtmpUrl.toLowerCase().includes('youtube.com'))
@@ -171,7 +174,19 @@ function loadLocalKeys(): StreamKeyRecord[] {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed.map((k: StreamKeyRecord) => normalizeStreamKeyRecord(k));
+        const normalized = parsed.map((k: StreamKeyRecord) => normalizeStreamKeyRecord(k));
+        const hasRealKey = normalized.some(
+          (k) =>
+            !k.id.startsWith('demo_') &&
+            k.streamKey !== 'yt-live-24x7-key' &&
+            k.streamKey !== 'FB-3948102948eQ-7'
+        );
+        if (hasRealKey) {
+          return normalized.map((k) =>
+            k.id.startsWith('demo_') ? { ...k, enabled: false } : k
+          );
+        }
+        return normalized;
       }
     }
   } catch {
@@ -755,11 +770,10 @@ export default function App() {
     };
 
     setLocalKeys((prev) => {
-      const cleaned = prev.map((k) =>
-        k.id.startsWith('demo_') ? { ...k, enabled: false } : k
-      );
+      const cleaned = prev.map((k) => ({ ...k, enabled: false }));
       return [newRec, ...cleaned];
     });
+    setFirestoreKeys((prev) => prev.map((k) => ({ ...k, enabled: false })));
 
     if (user) {
       setSavingKey(true);
@@ -1031,7 +1045,18 @@ export default function App() {
       ? enabledDestinations.map((d) => d.channelName || d.platform).join(', ')
       : t.noDestinationSelected;
 
-  const selectedVideo = videos.find((v) => v.id === selectedVideoId) || videos[0] || null;
+  const selectedVideo: UploadedVideo =
+    videos.find((v) => v.id === selectedVideoId) ||
+    videos[0] || {
+      id: 'sample_creatorlive_247',
+      originalName: '20_30_की_उम्र_में_अमीर_बनने_का_रहस्य_reelshorts.mp4',
+      fileName: 'sample_creatorlive_247.mp4',
+      url: '/assets/sample_creatorlive_247.mp4',
+      sizeBytes: 866402,
+      hasAudio: true,
+      durationSec: 6,
+      createdAt: Date.now(),
+    };
 
   // Go Live Now / Stop Live Handler
   const handleGoLiveOrStop = async () => {
@@ -1046,15 +1071,7 @@ export default function App() {
     if (streamKeyInput.trim().length > 0) {
       const newlySaved = await saveStreamKeyInternal();
       if (newlySaved) {
-        activeDestinations = [
-          newlySaved,
-          ...enabledDestinations.filter(
-            (k) =>
-              !k.id.startsWith('demo_') &&
-              k.streamKey !== 'yt-live-24x7-key' &&
-              k.streamKey !== 'FB-3948102948eQ-7'
-          ),
-        ];
+        activeDestinations = [newlySaved];
       }
     }
 
@@ -2890,34 +2907,39 @@ export default function App() {
                     )}
 
                     {sourceType === 'video' ? (
-                      selectedVideo ? (
-                        <div className="relative h-full w-full flex items-center justify-center">
-                          <video
-                            ref={uploadedVideoPlayerRef}
-                            key={selectedVideo.url}
-                            src={selectedVideo.url}
-                            poster={thumbnailDataUrl || undefined}
-                            className="h-full w-full object-contain"
-                            preload="auto"
-                            autoPlay
-                            loop={loop247}
-                            controls
-                            muted
-                            playsInline
-                            onEnded={(e) => {
-                              if (loop247) {
-                                const v = e.currentTarget;
-                                v.currentTime = 0;
-                                v.play().catch(() => {});
-                              }
-                            }}
-                          />
-                        </div>
-                      ) : (
-                        <div className="text-center text-slate-400 text-xs p-6">
-                          No video selected. Go back to Step 2 to choose or upload a video.
-                        </div>
-                      )
+                      <div className="relative h-full w-full flex items-center justify-center">
+                        <video
+                          ref={uploadedVideoPlayerRef}
+                          key={selectedVideo.url}
+                          src={selectedVideo.url}
+                          poster={thumbnailDataUrl || undefined}
+                          className="h-full w-full object-contain"
+                          preload="auto"
+                          autoPlay
+                          loop={loop247}
+                          controls
+                          muted
+                          playsInline
+                          onLoadedData={(e) => {
+                            e.currentTarget.play().catch(() => {});
+                          }}
+                          onError={(e) => {
+                            const v = e.currentTarget;
+                            if (!v.src.endsWith('/assets/sample_creatorlive_247.mp4')) {
+                              v.src = '/assets/sample_creatorlive_247.mp4';
+                              v.load();
+                              v.play().catch(() => {});
+                            }
+                          }}
+                          onEnded={(e) => {
+                            if (loop247) {
+                              const v = e.currentTarget;
+                              v.currentTime = 0;
+                              v.play().catch(() => {});
+                            }
+                          }}
+                        />
+                      </div>
                     ) : (
                       <video
                         ref={videoPreviewRef}
