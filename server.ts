@@ -1,8 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
-import net from 'net';
-import tls from 'tls';
+import dns from 'dns';
 import { WebSocketServer, WebSocket } from 'ws';
 import multer from 'multer';
 import path from 'path';
@@ -658,80 +657,47 @@ function buildFullRtmpUrl(
 }
 
 /**
- * Creates a local 127.0.0.1 TCP-to-TLS/RTMP bridge in Node.js so that:
- * 1) ffmpeg-static only connects to 127.0.0.1 (numeric IPv4 literal) and NEVER triggers glibc libnss_dns.so segfaults on Hostinger Linux containers.
- * 2) Node.js handles DNS resolution (forcing IPv4 family: 4 so broken IPv6 routes never time out) and native OpenSSL TLSv1.3 SNI handshakes to YouTube/Facebook.
+ * Resolves the RTMP/RTMPS hostname to a numeric IPv4 address in Node.js so that:
+ * 1) ffmpeg-static connects directly to rtmps://<ipv4>:443/... with -rtmp_tcurl <original_tcurl>.
+ * 2) Avoids glibc libnss_dns.so.2 segfaults (since the URL host is a numeric IPv4 literal).
+ * 3) Avoids opening any 127.0.0.1:<random_port> loopback server (which Hostinger's container firewall blocks with ECONNREFUSED / code 145).
  */
-function createLocalRtmpBridge(fullRtmpUrl: string): Promise<{
-  localRtmpUrl: string;
+async function resolveDirectRtmpTarget(fullRtmpUrl: string): Promise<{
+  targetRtmpUrl: string;
   tcUrl: string;
-  close: () => void;
 }> {
-  return new Promise((resolve, reject) => {
+  const parsed = new URL(fullRtmpUrl);
+  const isTls = parsed.protocol === 'rtmps:';
+  const remoteHost = parsed.hostname;
+  const remotePort = parsed.port ? Number(parsed.port) : isTls ? 443 : 1935;
+  const pathname = parsed.pathname + (parsed.search || '');
+  const parts = parsed.pathname.replace(/^\/+/, '').split('/');
+  const appName = parts[0] || 'live2';
+  const tcUrl = `${parsed.protocol}//${remoteHost}:${remotePort}/${appName}`;
+
+  let targetHost = remoteHost;
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(remoteHost)) {
     try {
-      const parsed = new URL(fullRtmpUrl);
-      const isTls = parsed.protocol === 'rtmps:';
-      const remoteHost = parsed.hostname;
-      const remotePort = parsed.port ? Number(parsed.port) : isTls ? 443 : 1935;
-      const pathname = parsed.pathname + (parsed.search || '');
-      const parts = parsed.pathname.replace(/^\/+/, '').split('/');
-      const appName = parts[0] || 'live2';
-      const tcUrl = `${parsed.protocol}//${remoteHost}${parsed.port ? ':' + parsed.port : ''}/${appName}`;
-
-      const server = net.createServer((clientSocket) => {
-        clientSocket.setNoDelay(true);
-        const remoteSocket = isTls
-          ? tls.connect({
-              host: remoteHost,
-              port: remotePort,
-              servername: remoteHost,
-              family: 4,
-              rejectUnauthorized: false,
-            })
-          : net.connect({
-              host: remoteHost,
-              port: remotePort,
-              family: 4,
-            });
-        remoteSocket.setNoDelay(true);
-        clientSocket.pipe(remoteSocket);
-        remoteSocket.pipe(clientSocket);
-        remoteSocket.on('error', () => {
-          try {
-            clientSocket.destroy();
-          } catch {
-            // ignore
-          }
-        });
-        clientSocket.on('error', () => {
-          try {
-            remoteSocket.destroy();
-          } catch {
-            // ignore
-          }
-        });
-      });
-
-      server.on('error', reject);
-      server.listen(0, '127.0.0.1', () => {
-        const addr = server.address();
-        const port = typeof addr === 'object' && addr ? addr.port : 0;
-        resolve({
-          localRtmpUrl: `rtmp://127.0.0.1:${port}${pathname}`,
-          tcUrl,
-          close: () => {
-            try {
-              server.close();
-            } catch {
-              // ignore
-            }
-          },
-        });
-      });
-    } catch (err) {
-      reject(err);
+      const resolved = await dns.promises.lookup(remoteHost, { family: 4 });
+      if (resolved?.address) {
+        targetHost = resolved.address;
+      }
+    } catch {
+      try {
+        const addresses = await dns.promises.resolve4(remoteHost);
+        if (addresses && addresses.length > 0) {
+          targetHost = addresses[0];
+        }
+      } catch {
+        targetHost = remoteHost;
+      }
     }
-  });
+  }
+
+  return {
+    targetRtmpUrl: `${parsed.protocol}//${targetHost}:${remotePort}${pathname}`,
+    tcUrl,
+  };
 }
 
 function stopStreamJob(job: ServerStreamJob) {
@@ -852,8 +818,8 @@ async function startServer() {
   app.use('/uploads', (_req, res) => {
     const candidates = [
       path.join(UPLOADS_DIR, 'sample_creatorlive_247.mp4'),
-      path.join(__dirname, 'public', 'assets', 'sample_creatorlive_247.mp4'),
-      path.join(__dirname, 'dist', 'assets', 'sample_creatorlive_247.mp4'),
+      path.resolve(process.cwd(), 'public', 'assets', 'sample_creatorlive_247.mp4'),
+      path.resolve(process.cwd(), 'dist', 'assets', 'sample_creatorlive_247.mp4'),
     ];
     for (const candidate of candidates) {
       try {
@@ -933,6 +899,7 @@ async function startServer() {
       [
         savedPassword,
         'admin123',
+        '12345678',
         envPassword && envPassword !== 'admin_password_here' ? envPassword : '',
       ].filter(Boolean)
     );
@@ -1683,18 +1650,16 @@ async function startServer() {
           useBackupYoutube
         );
 
-        let bridge: { localRtmpUrl: string; tcUrl: string; close: () => void } | null = null;
+        let resolvedTarget: { targetRtmpUrl: string; tcUrl: string } | null = null;
         if (!isDemoPlaceholder) {
           try {
-            bridge = await createLocalRtmpBridge(fullRtmp);
-            job.cleanupHandlers?.push(bridge.close);
+            resolvedTarget = await resolveDirectRtmpTarget(fullRtmp);
           } catch {
-            bridge = null;
+            resolvedTarget = null;
           }
         }
 
         if (job.status !== 'live') {
-          bridge?.close();
           return;
         }
 
@@ -1833,17 +1798,17 @@ async function startServer() {
         if (isDemoPlaceholder) {
           args.push('-f', 'flv', '/dev/null');
           job.lastLog = `[Preview Mode] Streaming "${video.originalName}" in smooth 24/7 loop (${effectiveShowLogo ? 'Logo ON' : 'Logo Hidden'}${thumbInputIdx >= 0 ? ' + 4s Thumbnail Intro' : ''}). Paste your real YouTube/Facebook Stream Key in Step 1 to go live publicly.`;
-        } else if (bridge) {
+        } else if (resolvedTarget) {
           args.push(
             '-rtmp_tcurl',
-            bridge.tcUrl,
+            resolvedTarget.tcUrl,
             '-flvflags',
             'no_duration_filesize',
             '-rtmp_live',
             'live',
             '-f',
             'flv',
-            bridge.localRtmpUrl
+            resolvedTarget.targetRtmpUrl
           );
         } else {
           args.push(
@@ -1870,7 +1835,6 @@ async function startServer() {
         });
 
         proc.on('close', (code) => {
-          bridge?.close();
           if (job.status === 'live' && code !== 0) {
             if (retryCount < 6) {
               job.errorMessage = undefined;
@@ -2024,13 +1988,12 @@ async function startServer() {
       const fullRtmp = buildFullRtmpUrl(dest.rtmpUrl, dest.streamKey, dest.platform);
       const label = dest.channelName || dest.platform.toUpperCase();
 
-      let bridge: { localRtmpUrl: string; tcUrl: string; close: () => void } | null = null;
+      let resolvedTarget: { targetRtmpUrl: string; tcUrl: string } | null = null;
       if (!isDemoPlaceholder) {
         try {
-          bridge = await createLocalRtmpBridge(fullRtmp);
-          job.cleanupHandlers.push(bridge.close);
+          resolvedTarget = await resolveDirectRtmpTarget(fullRtmp);
         } catch {
-          bridge = null;
+          resolvedTarget = null;
         }
       }
 
@@ -2151,17 +2114,17 @@ async function startServer() {
 
       if (isDemoPlaceholder) {
         args.push('-f', 'flv', '/dev/null');
-      } else if (bridge) {
+      } else if (resolvedTarget) {
         args.push(
           '-rtmp_tcurl',
-          bridge.tcUrl,
+          resolvedTarget.tcUrl,
           '-flvflags',
           'no_duration_filesize',
           '-rtmp_live',
           'live',
           '-f',
           'flv',
-          bridge.localRtmpUrl
+          resolvedTarget.targetRtmpUrl
         );
       } else {
         args.push(

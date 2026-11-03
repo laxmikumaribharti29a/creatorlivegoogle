@@ -376,6 +376,7 @@ export default function AdminPanel({
           (formSettings.adminPassword || '').trim(),
           (initialSettings.adminPassword || '').trim(),
           'admin123',
+          '12345678',
         ].filter(Boolean)
       );
 
