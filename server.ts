@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
+import net from 'net';
+import tls from 'tls';
 import { WebSocketServer, WebSocket } from 'ws';
 import multer from 'multer';
 import path from 'path';
@@ -81,6 +83,7 @@ export interface ServerStreamJob {
   errorMessage?: string;
   startedAt: number;
   processes: ChildProcessWithoutNullStreams[];
+  cleanupHandlers?: Array<() => void>;
   lastLog: string;
   framesSent: number;
   bitrateKbps: number;
@@ -587,6 +590,107 @@ function buildFullRtmpUrl(
   return `${base}/${trimmedKey}`;
 }
 
+/**
+ * Creates a local 127.0.0.1 TCP-to-TLS/RTMP bridge in Node.js so that:
+ * 1) ffmpeg-static only connects to 127.0.0.1 (numeric IPv4 literal) and NEVER triggers glibc libnss_dns.so segfaults on Hostinger Linux containers.
+ * 2) Node.js handles DNS resolution (forcing IPv4 family: 4 so broken IPv6 routes never time out) and native OpenSSL TLSv1.3 SNI handshakes to YouTube/Facebook.
+ */
+function createLocalRtmpBridge(fullRtmpUrl: string): Promise<{
+  localRtmpUrl: string;
+  tcUrl: string;
+  close: () => void;
+}> {
+  return new Promise((resolve, reject) => {
+    try {
+      const parsed = new URL(fullRtmpUrl);
+      const isTls = parsed.protocol === 'rtmps:';
+      const remoteHost = parsed.hostname;
+      const remotePort = parsed.port ? Number(parsed.port) : isTls ? 443 : 1935;
+      const pathname = parsed.pathname + (parsed.search || '');
+      const parts = parsed.pathname.replace(/^\/+/, '').split('/');
+      const appName = parts[0] || 'live2';
+      const tcUrl = `${parsed.protocol}//${remoteHost}${parsed.port ? ':' + parsed.port : ''}/${appName}`;
+
+      const server = net.createServer((clientSocket) => {
+        clientSocket.setNoDelay(true);
+        const remoteSocket = isTls
+          ? tls.connect({
+              host: remoteHost,
+              port: remotePort,
+              servername: remoteHost,
+              family: 4,
+              rejectUnauthorized: false,
+            })
+          : net.connect({
+              host: remoteHost,
+              port: remotePort,
+              family: 4,
+            });
+        remoteSocket.setNoDelay(true);
+        clientSocket.pipe(remoteSocket);
+        remoteSocket.pipe(clientSocket);
+        remoteSocket.on('error', () => {
+          try {
+            clientSocket.destroy();
+          } catch {
+            // ignore
+          }
+        });
+        clientSocket.on('error', () => {
+          try {
+            remoteSocket.destroy();
+          } catch {
+            // ignore
+          }
+        });
+      });
+
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        const port = typeof addr === 'object' && addr ? addr.port : 0;
+        resolve({
+          localRtmpUrl: `rtmp://127.0.0.1:${port}${pathname}`,
+          tcUrl,
+          close: () => {
+            try {
+              server.close();
+            } catch {
+              // ignore
+            }
+          },
+        });
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+function stopStreamJob(job: ServerStreamJob) {
+  job.status = 'stopped';
+  for (const proc of job.processes) {
+    try {
+      if (proc.stdin && !proc.stdin.destroyed) {
+        proc.stdin.end();
+      }
+      proc.kill('SIGTERM');
+    } catch {
+      // ignore
+    }
+  }
+  if (job.cleanupHandlers) {
+    for (const fn of job.cleanupHandlers) {
+      try {
+        fn();
+      } catch {
+        // ignore
+      }
+    }
+    job.cleanupHandlers = [];
+  }
+}
+
 function getResolutionArgs(
   quality: '480p' | '720p' | '1080p',
   orientation: 'landscape' | 'portrait'
@@ -660,9 +764,16 @@ async function startServer() {
   const app = express();
   const httpServer = createServer(app);
 
-  // Allow Firebase Google Auth popups to communicate with parent window on Hostinger custom domain
-  app.use((_req, res, next) => {
+  // Allow Firebase Google Auth popups AND cross-origin Hostinger <-> Cloud Streaming Server calls
+  app.use((req, res, next) => {
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
     next();
   });
 
@@ -1388,14 +1499,7 @@ async function startServer() {
 
       for (const [oldId, oldJob] of activeJobs.entries()) {
         if (oldJob.userId === userId) {
-          oldJob.status = 'stopped';
-          for (const proc of oldJob.processes) {
-            try {
-              proc.kill('SIGTERM');
-            } catch {
-              // ignore
-            }
-          }
+          stopStreamJob(oldJob);
           activeJobs.delete(oldId);
         }
       }
@@ -1428,12 +1532,13 @@ async function startServer() {
         status: 'live',
         startedAt: Date.now(),
         processes: [],
+        cleanupHandlers: [],
         lastLog: 'Starting 24/7 FFmpeg RTMP/RTMPS encoder...',
         framesSent: 0,
         bitrateKbps: parseInt(videoBitrate, 10),
       };
 
-      const spawnDestinationProcess = (dest: RtmpDestination, retryCount = 0) => {
+      const spawnDestinationProcess = async (dest: RtmpDestination, retryCount = 0) => {
         if (job.status !== 'live') return;
 
         const isDemoPlaceholder =
@@ -1449,6 +1554,21 @@ async function startServer() {
           dest.platform,
           usePlainRtmp
         );
+
+        let bridge: { localRtmpUrl: string; tcUrl: string; close: () => void } | null = null;
+        if (!isDemoPlaceholder) {
+          try {
+            bridge = await createLocalRtmpBridge(fullRtmp);
+            job.cleanupHandlers?.push(bridge.close);
+          } catch {
+            bridge = null;
+          }
+        }
+
+        if (job.status !== 'live') {
+          bridge?.close();
+          return;
+        }
 
         const args: string[] = [
           '-nostdin',
@@ -1492,10 +1612,6 @@ async function startServer() {
           logoInputIdx = nextInputIdx++;
         }
 
-        // Build high-speed, zero-buffering filter_complex:
-        // - Monotonic PTS (setpts=N/(FPS*TB) & asetpts=N/SR/TB) for seamless infinite 24/7 loops without timestamp jumps
-        // - Native yuv420p overlays (3.3x faster encoding, zero frame drops)
-        // - Thumbnail displays for the first 4 seconds (between(t,0,4)) on initial start like YouTube/Facebook, then plays video
         const filterChains: string[] = [];
         filterChains.push(
           `[0:v]fps=${targetFps},setpts=N/(${targetFps}*TB),scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[vbase]`
@@ -1585,6 +1701,18 @@ async function startServer() {
         if (isDemoPlaceholder) {
           args.push('-f', 'flv', '/dev/null');
           job.lastLog = `[Preview Mode] Streaming "${video.originalName}" in smooth 24/7 loop (${effectiveShowLogo ? 'Logo ON' : 'Logo Hidden'}${thumbInputIdx >= 0 ? ' + 4s Thumbnail Intro' : ''}). Paste your real YouTube/Facebook Stream Key in Step 1 to go live publicly.`;
+        } else if (bridge) {
+          args.push(
+            '-rtmp_tcurl',
+            bridge.tcUrl,
+            '-flvflags',
+            'no_duration_filesize',
+            '-rtmp_live',
+            'live',
+            '-f',
+            'flv',
+            bridge.localRtmpUrl
+          );
         } else {
           args.push(
             '-flvflags',
@@ -1610,12 +1738,13 @@ async function startServer() {
         });
 
         proc.on('close', (code) => {
+          bridge?.close();
           if (job.status === 'live' && code !== 0) {
             if (retryCount < 6) {
               job.errorMessage = undefined;
               job.lastLog = `[${label}] Switching RTMP/RTMPS transport & reconnecting stream (attempt ${retryCount + 1})...`;
               setTimeout(() => {
-                spawnDestinationProcess(dest, retryCount + 1);
+                void spawnDestinationProcess(dest, retryCount + 1);
               }, 1000);
             } else {
               job.errorMessage = `RTMP Server (${label}) closed connection (code ${code}). Verify your ${label} Stream Key is active and Live Studio is ready.`;
@@ -1628,7 +1757,7 @@ async function startServer() {
       };
 
       for (const dest of destinations as RtmpDestination[]) {
-        spawnDestinationProcess(dest);
+        void spawnDestinationProcess(dest);
       }
 
       activeJobs.set(jobId, job);
@@ -1702,17 +1831,7 @@ async function startServer() {
 
     for (const [id, job] of activeJobs.entries()) {
       if (!jobId || id === jobId || (sessionId && job.sessionId === sessionId)) {
-        job.status = 'stopped';
-        for (const proc of job.processes) {
-          try {
-            if (proc.stdin && !proc.stdin.destroyed) {
-              proc.stdin.end();
-            }
-            proc.kill('SIGTERM');
-          } catch {
-            // ignore
-          }
-        }
+        stopStreamJob(job);
         activeJobs.delete(id);
         stoppedCount++;
       }
@@ -1722,7 +1841,7 @@ async function startServer() {
   });
 
   // HTTP Browser Live Stream Relay (works through Hostinger CDN where wss:// WebSockets are blocked)
-  const spawnBrowserDestinationProcesses = (
+  const spawnBrowserDestinationProcesses = async (
     job: ServerStreamJob,
     msg: {
       destinations?: RtmpDestination[];
@@ -1760,6 +1879,10 @@ async function startServer() {
     const logoFilePath = effectiveShowLogo ? resolveLogoFilePath() : null;
     const thumbFilePath = resolveThumbnailFilePath(job.jobId, msg.thumbnailDataUrl);
 
+    if (!job.cleanupHandlers) {
+      job.cleanupHandlers = [];
+    }
+
     for (const dest of destinations) {
       const isDemoPlaceholder =
         dest.streamKey === 'yt-live-24x7-key' ||
@@ -1768,6 +1891,16 @@ async function startServer() {
 
       const fullRtmp = buildFullRtmpUrl(dest.rtmpUrl, dest.streamKey, dest.platform);
       const label = dest.channelName || dest.platform.toUpperCase();
+
+      let bridge: { localRtmpUrl: string; tcUrl: string; close: () => void } | null = null;
+      if (!isDemoPlaceholder) {
+        try {
+          bridge = await createLocalRtmpBridge(fullRtmp);
+          job.cleanupHandlers.push(bridge.close);
+        } catch {
+          bridge = null;
+        }
+      }
 
       const args: string[] = [
         '-y',
@@ -1882,6 +2015,18 @@ async function startServer() {
 
       if (isDemoPlaceholder) {
         args.push('-f', 'flv', '/dev/null');
+      } else if (bridge) {
+        args.push(
+          '-rtmp_tcurl',
+          bridge.tcUrl,
+          '-flvflags',
+          'no_duration_filesize',
+          '-rtmp_live',
+          'live',
+          '-f',
+          'flv',
+          bridge.localRtmpUrl
+        );
       } else {
         args.push(
           '-flvflags',
@@ -1903,6 +2048,10 @@ async function startServer() {
       proc.on('error', (err) => {
         job.errorMessage = `RTMP error (${label}): ${err.message}`;
         job.lastLog = job.errorMessage;
+      });
+
+      proc.on('close', () => {
+        bridge?.close();
       });
 
       proc.stdin.on('error', () => {});

@@ -694,7 +694,7 @@ export default function App() {
   };
 
   // Save a Stream Key
-  const saveStreamKeyInternal = async (): Promise<boolean> => {
+  const saveStreamKeyInternal = async (): Promise<StreamKeyRecord | null> => {
     const trimmedKey = streamKeyInput.trim().slice(0, MAX_STREAM_KEY_LEN);
     const trimmedUrl = rtmpUrlInput.trim().slice(0, MAX_RTMP_URL_LEN);
 
@@ -733,14 +733,14 @@ export default function App() {
         type: 'error',
         message: 'Please enter a valid Stream Key.',
       });
-      return false;
+      return null;
     }
     if (effectiveUrl.length < 5) {
       setFormFeedback({
         type: 'error',
         message: 'Please enter a valid RTMP Server URL.',
       });
-      return false;
+      return null;
     }
 
     const keyId = `key_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -787,7 +787,7 @@ export default function App() {
       type: 'success',
       message: `${trimmedChannel} stream key saved and selected!`,
     });
-    return true;
+    return newRec;
   };
 
   const handleSaveStreamKey = async (e: React.FormEvent) => {
@@ -799,8 +799,8 @@ export default function App() {
   const handleStep1Next = async () => {
     setFormFeedback(null);
     if (streamKeyInput.trim().length > 0) {
-      const ok = await saveStreamKeyInternal();
-      if (!ok) return;
+      const saved = await saveStreamKeyInternal();
+      if (!saved) return;
     }
     setStep(2);
   };
@@ -1042,7 +1042,23 @@ export default function App() {
       return;
     }
 
-    if (enabledDestinations.length === 0) {
+    let activeDestinations = enabledDestinations;
+    if (streamKeyInput.trim().length > 0) {
+      const newlySaved = await saveStreamKeyInternal();
+      if (newlySaved) {
+        activeDestinations = [
+          newlySaved,
+          ...enabledDestinations.filter(
+            (k) =>
+              !k.id.startsWith('demo_') &&
+              k.streamKey !== 'yt-live-24x7-key' &&
+              k.streamKey !== 'FB-3948102948eQ-7'
+          ),
+        ];
+      }
+    }
+
+    if (activeDestinations.length === 0) {
       setFormFeedback({
         type: 'error',
         message: 'Please select or save at least one Stream Key in Step 1.',
@@ -1054,7 +1070,10 @@ export default function App() {
     setIsStartingStream(true);
     const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const safeTitle = (streamTitle.trim() || 'My Live Stream').slice(0, MAX_TITLE_LEN);
-    const safeDestSummary = destinationSummary.slice(0, 256);
+    const safeDestSummary = activeDestinations
+      .map((d) => d.channelName || d.platform)
+      .join(', ')
+      .slice(0, 256);
 
     try {
       if (sourceType === 'video') {
@@ -1078,7 +1097,7 @@ export default function App() {
             // Pass false so FFmpeg shows thumbnail for the first 4 seconds (between(t,0,4)) then plays video for viewers
             showThumbnailOverlay: false,
             showWatermarkLogo: effectiveShowStreamLogo,
-            destinations: enabledDestinations.map((d) => ({
+            destinations: activeDestinations.map((d) => ({
               id: d.id,
               platform: d.platform,
               channelName: d.channelName,
@@ -1149,7 +1168,7 @@ export default function App() {
             thumbnailDataUrl,
             showThumbnailOverlay: false,
             showWatermarkLogo: effectiveShowStreamLogo,
-            destinations: enabledDestinations.map((d) => ({
+            destinations: activeDestinations.map((d) => ({
               id: d.id,
               platform: d.platform,
               channelName: d.channelName,
@@ -2226,7 +2245,12 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setStep(2)}
+                  onClick={async () => {
+                    if (streamKeyInput.trim().length > 0) {
+                      await saveStreamKeyInternal();
+                    }
+                    setStep(2);
+                  }}
                   className={`px-4 sm:px-5 py-2 rounded-full text-xs sm:text-sm font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                     step === 2
                       ? 'bg-[#e60012] text-white shadow-xs'
@@ -2237,7 +2261,12 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setStep(3)}
+                  onClick={async () => {
+                    if (streamKeyInput.trim().length > 0) {
+                      await saveStreamKeyInternal();
+                    }
+                    setStep(3);
+                  }}
                   className={`px-4 sm:px-5 py-2 rounded-full text-xs sm:text-sm font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                     step === 3
                       ? 'bg-[#e60012] text-white shadow-xs'
