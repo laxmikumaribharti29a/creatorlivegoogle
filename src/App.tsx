@@ -86,6 +86,7 @@ interface ActiveServerJob {
   sessionId: string;
   title: string;
   sourceType: 'video' | 'camera' | 'screen';
+  videoId?: string;
   videoFileName?: string;
   orientation: 'landscape' | 'portrait';
   quality: '480p' | '720p' | '1080p';
@@ -127,7 +128,7 @@ const INITIAL_DEMO_KEYS: StreamKeyRecord[] = [
     channelName: 'Facebook',
     streamKey: 'FB-3948102948eQ-7',
     rtmpUrl: 'rtmps://live-api-s.facebook.com:443/rtmp',
-    enabled: false,
+    enabled: true,
   },
 ];
 
@@ -150,9 +151,6 @@ const DEFAULT_SITE_SETTINGS: MainPageSettings = {
 };
 
 function normalizeStreamKeyRecord(item: StreamKeyRecord): StreamKeyRecord {
-  if (item.id === 'demo_fb_1' || item.streamKey === 'FB-3948102948eQ-7') {
-    return { ...item, enabled: false };
-  }
   if (
     item.platform === 'youtube' ||
     (item.rtmpUrl && item.rtmpUrl.toLowerCase().includes('youtube.com'))
@@ -347,7 +345,7 @@ export default function App() {
   const [localKeys, setLocalKeys] = useState<StreamKeyRecord[]>(() => loadLocalKeys());
   const streamKeys = user && firestoreKeys.length > 0 ? firestoreKeys : localKeys;
 
-  // Step 1 Form State (Default to YouTube matching "1. YouTube & Key")
+  // Step 1 Form State
   const [newPlatform, setNewPlatform] = useState<'youtube' | 'facebook' | 'custom'>('youtube');
   const [channelName, setChannelName] = useState('');
   const [streamKeyInput, setStreamKeyInput] = useState('');
@@ -708,12 +706,12 @@ export default function App() {
     setFormFeedback(null);
   };
 
-  // Save a Stream Key
-  const saveStreamKeyInternal = async (): Promise<StreamKeyRecord | null> => {
+  // Save Stream Key (keeps other platforms enabled so YouTube + Facebook work simultaneously)
+  const saveStreamKeyInternal = async (): Promise<StreamKeyRecord[]> => {
     const trimmedKey = streamKeyInput.trim().slice(0, MAX_STREAM_KEY_LEN);
     const trimmedUrl = rtmpUrlInput.trim().slice(0, MAX_RTMP_URL_LEN);
 
-    let effectivePlatform = newPlatform;
+    let effectivePlatform: 'youtube' | 'facebook' | 'custom' = newPlatform;
     let effectiveUrl = trimmedUrl;
     const isYoutubePattern =
       /^[a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}(-[a-zA-Z0-9]{4})?$/.test(
@@ -748,14 +746,14 @@ export default function App() {
         type: 'error',
         message: 'Please enter a valid Stream Key.',
       });
-      return null;
+      return [];
     }
     if (effectiveUrl.length < 5) {
       setFormFeedback({
         type: 'error',
         message: 'Please enter a valid RTMP Server URL.',
       });
-      return null;
+      return [];
     }
 
     const keyId = `key_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -769,11 +767,28 @@ export default function App() {
       enabled: true,
     };
 
+    // Keep other platforms (e.g. YouTube when saving Facebook, or Facebook when saving YouTube) enabled
+    // so both YouTube and Facebook stream simultaneously ("dono ek sath")
     setLocalKeys((prev) => {
-      const cleaned = prev.map((k) => ({ ...k, enabled: false }));
+      const cleaned = prev.map((k) => {
+        const isDemo =
+          k.id.startsWith('demo_') ||
+          k.streamKey === 'yt-live-24x7-key' ||
+          k.streamKey === 'FB-3948102948eQ-7';
+        if (isDemo || k.platform === effectivePlatform) {
+          return { ...k, enabled: false };
+        }
+        return k;
+      });
       return [newRec, ...cleaned];
     });
-    setFirestoreKeys((prev) => prev.map((k) => ({ ...k, enabled: false })));
+    setFirestoreKeys((prev) =>
+      prev.map((k) =>
+        k.platform === effectivePlatform || k.id.startsWith('demo_')
+          ? { ...k, enabled: false }
+          : k
+      )
+    );
 
     if (user) {
       setSavingKey(true);
@@ -799,9 +814,9 @@ export default function App() {
     setStreamKeyInput('');
     setFormFeedback({
       type: 'success',
-      message: `${trimmedChannel} stream key saved and selected!`,
+      message: `${trimmedChannel} stream key saved and enabled!`,
     });
-    return newRec;
+    return [newRec];
   };
 
   const handleSaveStreamKey = async (e: React.FormEvent) => {
@@ -814,7 +829,7 @@ export default function App() {
     setFormFeedback(null);
     if (streamKeyInput.trim().length > 0) {
       const saved = await saveStreamKeyInternal();
-      if (!saved) return;
+      if (saved.length === 0) return;
     }
     setStep(2);
   };
@@ -1046,6 +1061,9 @@ export default function App() {
       : t.noDestinationSelected;
 
   const selectedVideo: UploadedVideo =
+    (currentActiveJob?.videoId
+      ? videos.find((v) => v.id === currentActiveJob.videoId)
+      : undefined) ||
     videos.find((v) => v.id === selectedVideoId) ||
     videos[0] || {
       id: 'sample_creatorlive_247',
@@ -1068,10 +1086,23 @@ export default function App() {
     }
 
     let activeDestinations = enabledDestinations;
-    if (streamKeyInput.trim().length > 0) {
+    const hasUnsavedInput =
+      newPlatform === 'both'
+        ? dualYoutubeKeyInput.trim().length > 0 || dualFacebookKeyInput.trim().length > 0
+        : streamKeyInput.trim().length > 0;
+
+    if (hasUnsavedInput) {
       const newlySaved = await saveStreamKeyInternal();
-      if (newlySaved) {
-        activeDestinations = [newlySaved];
+      if (newlySaved.length > 0) {
+        const savedPlatforms = new Set(newlySaved.map((k) => k.platform));
+        const keptExisting = enabledDestinations.filter(
+          (k) =>
+            !savedPlatforms.has(k.platform) &&
+            !k.id.startsWith('demo_') &&
+            k.streamKey !== 'yt-live-24x7-key' &&
+            k.streamKey !== 'FB-3948102948eQ-7'
+        );
+        activeDestinations = [...newlySaved, ...keptExisting];
       }
     }
 
@@ -1089,7 +1120,7 @@ export default function App() {
     const safeTitle = (streamTitle.trim() || 'My Live Stream').slice(0, MAX_TITLE_LEN);
     const safeDestSummary = activeDestinations
       .map((d) => d.channelName || d.platform)
-      .join(', ')
+      .join(' + ')
       .slice(0, 256);
 
     try {
@@ -2263,7 +2294,12 @@ export default function App() {
                 <button
                   type="button"
                   onClick={async () => {
-                    if (streamKeyInput.trim().length > 0) {
+                    const hasUnsaved =
+                      newPlatform === 'both'
+                        ? dualYoutubeKeyInput.trim().length > 0 ||
+                          dualFacebookKeyInput.trim().length > 0
+                        : streamKeyInput.trim().length > 0;
+                    if (hasUnsaved) {
                       await saveStreamKeyInternal();
                     }
                     setStep(2);
@@ -2431,7 +2467,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => handleSelectPlatformTab('youtube')}
-                        className={`py-2.5 px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        className={`py-2.5 px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                           newPlatform === 'youtube'
                             ? 'border-[#b91c1c] bg-red-50/20 text-slate-900'
                             : 'border-slate-200 text-slate-700 hover:bg-slate-50'
@@ -2446,7 +2482,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => handleSelectPlatformTab('facebook')}
-                        className={`py-2.5 px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        className={`py-2.5 px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                           newPlatform === 'facebook'
                             ? 'border-[#b91c1c] bg-red-50/20 text-slate-900'
                             : 'border-slate-200 text-slate-700 hover:bg-slate-50'
@@ -2461,7 +2497,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => handleSelectPlatformTab('custom')}
-                        className={`py-2.5 px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        className={`py-2.5 px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                           newPlatform === 'custom'
                             ? 'border-[#b91c1c] bg-red-50/20 text-slate-900'
                             : 'border-slate-200 text-slate-700 hover:bg-slate-50'
