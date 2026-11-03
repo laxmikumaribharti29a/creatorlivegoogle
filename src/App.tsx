@@ -843,7 +843,8 @@ export default function App() {
     setFormFeedback(null);
     cancelUploadRef.current = false;
 
-    const CHUNK_SIZE = 4 * 1024 * 1024;
+    // 512 KB chunks ensure Hostinger CDN / reverse proxies never reject uploads with HTTP 413
+    const CHUNK_SIZE = 512 * 1024;
     const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
     const uploadId = `up_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -966,14 +967,44 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        setThumbnailDataUrl(reader.result);
-        // Show thumbnail like YouTube/Facebook for 4 seconds, then auto-play video
-        triggerThumbnailIntro(4);
-        setFormFeedback({
-          type: 'success',
-          message:
-            'Thumbnail set! Viewers will see this thumbnail for a few seconds and then the video will automatically start playing.',
-        });
+        const rawDataUrl = reader.result;
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const canvas = document.createElement('canvas');
+            const targetW = 1280;
+            const targetH = 720;
+            canvas.width = targetW;
+            canvas.height = targetH;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.fillStyle = '#000000';
+              ctx.fillRect(0, 0, targetW, targetH);
+              const scale = Math.min(targetW / img.width, targetH / img.height);
+              const drawW = img.width * scale;
+              const drawH = img.height * scale;
+              ctx.drawImage(img, (targetW - drawW) / 2, (targetH - drawH) / 2, drawW, drawH);
+              const compressed = canvas.toDataURL('image/jpeg', 0.8);
+              setThumbnailDataUrl(compressed);
+            } else {
+              setThumbnailDataUrl(rawDataUrl);
+            }
+          } catch {
+            setThumbnailDataUrl(rawDataUrl);
+          }
+          // Show thumbnail like YouTube/Facebook for 4 seconds, then auto-play video
+          triggerThumbnailIntro(4);
+          setFormFeedback({
+            type: 'success',
+            message:
+              'Thumbnail set! Viewers will see this thumbnail for a few seconds and then the video will automatically start playing.',
+          });
+        };
+        img.onerror = () => {
+          setThumbnailDataUrl(rawDataUrl);
+          triggerThumbnailIntro(4);
+        };
+        img.src = rawDataUrl;
       }
     };
     reader.readAsDataURL(file);
@@ -1104,39 +1135,36 @@ export default function App() {
           );
         }
 
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws/stream`;
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        await new Promise<void>((resolve, reject) => {
-          ws.onopen = () => {
-            ws.send(
-              JSON.stringify({
-                type: 'start',
-                userId: activeIdentifier || activeUserId,
-                sessionId,
-                title: safeTitle,
-                sourceType,
-                orientation,
-                quality,
-                fps,
-                thumbnailDataUrl,
-                showThumbnailOverlay: false,
-                showWatermarkLogo: effectiveShowStreamLogo,
-                destinations: enabledDestinations.map((d) => ({
-                  id: d.id,
-                  platform: d.platform,
-                  channelName: d.channelName,
-                  rtmpUrl: d.rtmpUrl,
-                  streamKey: d.streamKey,
-                })),
-              })
-            );
-            resolve();
-          };
-          ws.onerror = () => reject(new Error('WebSocket connection failed'));
+        const startRes = await fetch('/api/streams/browser-start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: activeIdentifier || activeUserId,
+            sessionId,
+            title: safeTitle,
+            sourceType,
+            orientation,
+            quality,
+            fps,
+            thumbnailDataUrl,
+            showThumbnailOverlay: false,
+            showWatermarkLogo: effectiveShowStreamLogo,
+            destinations: enabledDestinations.map((d) => ({
+              id: d.id,
+              platform: d.platform,
+              channelName: d.channelName,
+              rtmpUrl: d.rtmpUrl,
+              streamKey: d.streamKey,
+            })),
+          }),
         });
+
+        const startData = await startRes.json();
+        if (!startRes.ok || !startData.jobId) {
+          throw new Error(startData.error || 'Failed to initialize live browser stream on server.');
+        }
+
+        const activeBrowserJobId = String(startData.jobId);
 
         const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
           ? 'video/webm;codecs=vp8,opus'
@@ -1145,12 +1173,27 @@ export default function App() {
         const recorder = new MediaRecorder(mediaStreamRef.current, {
           mimeType,
           videoBitsPerSecond:
-            quality === '1080p' ? 4500000 : quality === '480p' ? 1200000 : 2500000,
+            quality === '1080p' ? 2800000 : quality === '480p' ? 1000000 : 1800000,
         });
 
+        let chunkChain = Promise.resolve();
         recorder.ondataavailable = (ev) => {
-          if (ev.data && ev.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-            ws.send(ev.data);
+          if (ev.data && ev.data.size > 0) {
+            const blob = ev.data;
+            chunkChain = chunkChain
+              .then(async () => {
+                await fetch(
+                  `/api/streams/browser-chunk?jobId=${encodeURIComponent(activeBrowserJobId)}`,
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/octet-stream' },
+                    body: blob,
+                  }
+                );
+              })
+              .catch(() => {
+                // ignore transient network hiccup
+              });
           }
         };
 
