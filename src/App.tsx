@@ -1086,10 +1086,7 @@ export default function App() {
     }
 
     let activeDestinations = enabledDestinations;
-    const hasUnsavedInput =
-      newPlatform === 'both'
-        ? dualYoutubeKeyInput.trim().length > 0 || dualFacebookKeyInput.trim().length > 0
-        : streamKeyInput.trim().length > 0;
+    const hasUnsavedInput = streamKeyInput.trim().length > 0;
 
     if (hasUnsavedInput) {
       const newlySaved = await saveStreamKeyInternal();
@@ -1577,7 +1574,7 @@ export default function App() {
       )}
 
       {/* Top Navigation Bar (100% Same-to-Same with Screenshots) */}
-      <header className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-slate-100 px-6 sm:px-10 py-3.5 flex items-center justify-between gap-4">
+      <header className="sticky top-0 z-40 bg-white/95 backdrop-blur border-b border-slate-100 px-6 sm:px-10 py-3.5 flex items-center justify-between gap-4">
         {/* Left: CreatorLive24/7 Logo */}
         <a
           href="#top"
@@ -2294,11 +2291,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={async () => {
-                    const hasUnsaved =
-                      newPlatform === 'both'
-                        ? dualYoutubeKeyInput.trim().length > 0 ||
-                          dualFacebookKeyInput.trim().length > 0
-                        : streamKeyInput.trim().length > 0;
+                    const hasUnsaved = streamKeyInput.trim().length > 0;
                     if (hasUnsaved) {
                       await saveStreamKeyInternal();
                     }
@@ -2872,10 +2865,10 @@ export default function App() {
                   </div>
 
                   {/* Video Preview Monitor */}
-                  <div className="relative w-full aspect-video rounded-2xl overflow-hidden bg-[#060814] flex items-center justify-center border border-slate-900">
+                  <div className="relative isolate w-full aspect-video rounded-2xl overflow-hidden bg-[#060814] flex items-center justify-center border border-slate-900">
                     {/* Website Logo Watermark (Always shown when not allowed to hide; Hide/Unhide when allowed in Admin User List) */}
                     {effectiveShowStreamLogo && (
-                      <div className="absolute top-3 left-3 z-30 flex flex-col items-start gap-1.5">
+                      <div className="absolute top-3 left-3 z-20 flex flex-col items-start gap-1.5">
                         <div className="bg-white/95 backdrop-blur-xs px-2.5 py-1 rounded-lg shadow-sm border border-white/40">
                           <img
                             src={siteSettings.logoUrl}
@@ -2891,18 +2884,18 @@ export default function App() {
                     )}
 
                     {!effectiveShowStreamLogo && (
-                      <div className="absolute top-3 left-3 z-30 bg-black/75 backdrop-blur-xs text-white px-2.5 py-1 rounded-md text-xs font-mono font-semibold tabular-nums">
+                      <div className="absolute top-3 left-3 z-20 bg-black/75 backdrop-blur-xs text-white px-2.5 py-1 rounded-md text-xs font-mono font-semibold tabular-nums">
                         {formatDuration(liveTimerSec)}
                       </div>
                     )}
 
-                    <div className="absolute top-3 right-3 z-30 bg-black/75 backdrop-blur-xs text-white px-2.5 py-1 rounded-md text-xs font-mono font-semibold tabular-nums">
+                    <div className="absolute top-3 right-3 z-20 bg-black/75 backdrop-blur-xs text-white px-2.5 py-1 rounded-md text-xs font-mono font-semibold tabular-nums">
                       {quality} · {fps}fps
                     </div>
 
                     {/* Uploaded Thumbnail 4-Second Intro Overlay (Shows like YouTube/Facebook, then auto-plays video) */}
                     {thumbnailDataUrl && showThumbnailToViewers && (
-                      <div className="absolute inset-0 z-20 bg-black flex items-center justify-center">
+                      <div className="absolute inset-0 z-10 bg-black flex items-center justify-center">
                         <img
                           src={thumbnailDataUrl}
                           alt="Live Stream Thumbnail"
@@ -2931,7 +2924,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={handleToggleMic}
-                        className="absolute bottom-3 left-3 z-30 bg-black/75 hover:bg-black text-white p-2 rounded-full transition-colors"
+                        className="absolute bottom-3 left-3 z-20 bg-black/75 hover:bg-black text-white p-2 rounded-full transition-colors"
                         aria-label="Toggle Microphone"
                       >
                         {isMicMuted ? (

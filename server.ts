@@ -1,15 +1,13 @@
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
-import net from 'net';
-import tls from 'tls';
-import dns from 'dns';
 import { WebSocketServer, WebSocket } from 'ws';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import ffmpegStatic from 'ffmpeg-static';
+import { FlvPipeHub, NativeRtmpPublisher, probeRtmpsEndpoint } from './rtmpPublisher.ts';
 
 // Ensure working directory is always the repository root even if Hostinger starts from a subdirectory (e.g. .aistudio)
 if (
@@ -97,6 +95,8 @@ export interface UploadedVideoFile {
   filePath: string;
   sizeBytes: number;
   hasAudio?: boolean;
+  videoCodec?: string;
+  audioCodec?: string;
   durationSec?: number;
   createdAt: number;
 }
@@ -454,16 +454,22 @@ function loadCatalog() {
 
 function probeVideoFile(
   filePath: string
-): Promise<{ isValid: boolean; hasAudio: boolean; durationSec: number }> {
+): Promise<{
+  isValid: boolean;
+  hasAudio: boolean;
+  videoCodec: string;
+  audioCodec: string;
+  durationSec: number;
+}> {
   return new Promise((resolve) => {
     try {
       if (!fs.existsSync(filePath)) {
-        resolve({ isValid: false, hasAudio: false, durationSec: 0 });
+        resolve({ isValid: false, hasAudio: false, videoCodec: '', audioCodec: '', durationSec: 0 });
         return;
       }
       const stat = fs.statSync(filePath);
       if (!stat.isFile() || stat.size < 4096) {
-        resolve({ isValid: false, hasAudio: false, durationSec: 0 });
+        resolve({ isValid: false, hasAudio: false, videoCodec: '', audioCodec: '', durationSec: 0 });
         return;
       }
 
@@ -482,7 +488,13 @@ function probeVideoFile(
         } catch {
           // ignore
         }
-        resolve({ isValid: true, hasAudio: true, durationSec: 0 });
+        resolve({
+          isValid: true,
+          hasAudio: true,
+          videoCodec: 'h264',
+          audioCodec: 'aac',
+          durationSec: 0,
+        });
       }, 8000);
 
       proc.stderr.on('data', (chunk: Buffer) => {
@@ -491,12 +503,16 @@ function probeVideoFile(
 
       proc.on('close', () => {
         clearTimeout(timer);
-        const hasVideo = /Stream #\d+:\d+.*Video:/i.test(stderr);
+        const videoMatch = stderr.match(/Stream #\d+:\d+.*Video:\s*([a-zA-Z0-9_]+)/i);
+        const audioMatch = stderr.match(/Stream #\d+:\d+.*Audio:\s*([a-zA-Z0-9_]+)/i);
+        const hasVideo = Boolean(videoMatch);
         const hasCorruptError =
           /moov atom not found|Invalid data found when processing input|End of file/i.test(
             stderr
           ) && !hasVideo;
-        const hasAudio = /Stream #\d+:\d+.*Audio:/i.test(stderr);
+        const hasAudio = Boolean(audioMatch);
+        const videoCodec = (videoMatch?.[1] || '').toLowerCase();
+        const audioCodec = (audioMatch?.[1] || '').toLowerCase();
         let durationSec = 0;
         const durMatch = stderr.match(/Duration:\s*(\d+):(\d+):([\d.]+)/i);
         if (durMatch) {
@@ -508,16 +524,18 @@ function probeVideoFile(
         resolve({
           isValid: hasVideo && !hasCorruptError,
           hasAudio,
+          videoCodec,
+          audioCodec,
           durationSec,
         });
       });
 
       proc.on('error', () => {
         clearTimeout(timer);
-        resolve({ isValid: false, hasAudio: false, durationSec: 0 });
+        resolve({ isValid: false, hasAudio: false, videoCodec: '', audioCodec: '', durationSec: 0 });
       });
     } catch {
-      resolve({ isValid: false, hasAudio: false, durationSec: 0 });
+      resolve({ isValid: false, hasAudio: false, videoCodec: '', audioCodec: '', durationSec: 0 });
     }
   });
 }
@@ -657,12 +675,15 @@ function buildFullRtmpUrl(
   rtmpUrl: string,
   streamKey: string,
   platform?: string,
-  useBackupYoutubeServer = false
+  attemptIndex = 0
 ): string {
   const cleanKey = streamKey.trim();
-  const ytBase = useBackupYoutubeServer
-    ? 'rtmps://b.rtmps.youtube.com:443/live2'
-    : 'rtmps://a.rtmps.youtube.com:443/live2';
+  const ytEndpoints = [
+    'rtmps://a.rtmps.youtube.com:443/live2',
+    'rtmps://b.rtmps.youtube.com:443/live2',
+    'rtmp://a.rtmp.youtube.com:1935/live2',
+  ];
+  const ytBase = ytEndpoints[attemptIndex % ytEndpoints.length];
 
   if (cleanKey.startsWith('rtmp://') || cleanKey.startsWith('rtmps://')) {
     if (cleanKey.includes('youtube.com')) {
@@ -697,151 +718,6 @@ function buildFullRtmpUrl(
 
   const trimmedKey = cleanKey.replace(/^\/+/, '');
   return `${base}/${trimmedKey}`;
-}
-
-/**
- * Creates a persistent local 127.0.0.1 TCP-to-TLS/TCP bridge in Node.js so that:
- * 1) ffmpeg-static connects to rtmp://127.0.0.1:<port>/... (numeric IPv4 -> zero glibc libnss_dns segfaults).
- * 2) Node.js resolves the remote hostname to IPv4 and performs the TLS handshake with full SNI (servername: remoteHost),
- *    which is required by Facebook (live-api-s.facebook.com:443) and YouTube (a.rtmps.youtube.com:443).
- * 3) Pauses the local FFmpeg socket until 'secureConnect' completes so the initial 1537-byte RTMP C0+C1 handshake
- *    packet is never lost during TLS negotiation.
- * 4) Stays listening for the entire lifetime of the stream job so reconnect attempts never hit ECONNREFUSED.
- */
-async function createPersistentRtmpBridge(getFullRtmpUrl: () => string): Promise<{
-  getConnectParams: () => { localRtmpUrl: string; tcUrl: string };
-  close: () => void;
-}> {
-  const activeSockets = new Set<net.Socket>();
-
-  const server = net.createServer(async (clientSocket) => {
-    activeSockets.add(clientSocket);
-    clientSocket.setNoDelay(true);
-    clientSocket.pause();
-
-    let remoteSocket: net.Socket | tls.TLSSocket | null = null;
-
-    const cleanupPair = () => {
-      activeSockets.delete(clientSocket);
-      if (remoteSocket) {
-        activeSockets.delete(remoteSocket);
-        if (!remoteSocket.destroyed) remoteSocket.destroy();
-      }
-      if (!clientSocket.destroyed) clientSocket.destroy();
-    };
-
-    clientSocket.on('error', cleanupPair);
-    clientSocket.on('close', cleanupPair);
-
-    try {
-      const currentFullUrl = getFullRtmpUrl();
-      const parsed = new URL(currentFullUrl);
-      const isTls = parsed.protocol === 'rtmps:';
-      const remoteHost = parsed.hostname;
-      const remotePort = parsed.port ? Number(parsed.port) : isTls ? 443 : 1935;
-
-      let connectHost = remoteHost;
-      if (!/^\d+\.\d+\.\d+\.\d+$/.test(remoteHost)) {
-        try {
-          const resolved = await dns.promises.lookup(remoteHost, { family: 4 });
-          if (resolved?.address) {
-            connectHost = resolved.address;
-          }
-        } catch {
-          try {
-            const addresses = await dns.promises.resolve4(remoteHost);
-            if (addresses && addresses.length > 0) {
-              connectHost = addresses[0];
-            }
-          } catch {
-            connectHost = remoteHost;
-          }
-        }
-      }
-
-      if (clientSocket.destroyed) return;
-
-      remoteSocket = isTls
-        ? tls.connect({
-            host: connectHost,
-            port: remotePort,
-            servername: remoteHost,
-            rejectUnauthorized: false,
-          })
-        : net.connect({
-            host: connectHost,
-            port: remotePort,
-          });
-
-      activeSockets.add(remoteSocket);
-      remoteSocket.setNoDelay(true);
-
-      const onUpstreamReady = () => {
-        if (clientSocket.destroyed || !remoteSocket || remoteSocket.destroyed) return;
-        clientSocket.pipe(remoteSocket);
-        remoteSocket.pipe(clientSocket);
-        clientSocket.resume();
-      };
-
-      if (isTls) {
-        remoteSocket.once('secureConnect', onUpstreamReady);
-      } else {
-        remoteSocket.once('connect', onUpstreamReady);
-      }
-
-      remoteSocket.on('error', cleanupPair);
-      remoteSocket.on('close', cleanupPair);
-    } catch {
-      cleanupPair();
-    }
-  });
-
-  server.on('error', () => {
-    // ignore server error
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      server.removeListener('error', reject);
-      resolve();
-    });
-  });
-
-  const addr = server.address() as net.AddressInfo;
-  const localPort = addr.port;
-
-  return {
-    getConnectParams: () => {
-      const currentFullUrl = getFullRtmpUrl();
-      const parsed = new URL(currentFullUrl);
-      const isTls = parsed.protocol === 'rtmps:';
-      const remoteHost = parsed.hostname;
-      const remotePort = parsed.port ? Number(parsed.port) : isTls ? 443 : 1935;
-      const pathname = parsed.pathname + (parsed.search || '');
-      const parts = parsed.pathname.replace(/^\/+/, '').split('/');
-      const appName = parts[0] || 'live2';
-      return {
-        localRtmpUrl: `rtmp://127.0.0.1:${localPort}${pathname}`,
-        tcUrl: `${parsed.protocol}//${remoteHost}:${remotePort}/${appName}`,
-      };
-    },
-    close: () => {
-      for (const sock of activeSockets) {
-        try {
-          sock.destroy();
-        } catch {
-          // ignore
-        }
-      }
-      activeSockets.clear();
-      try {
-        server.close();
-      } catch {
-        // ignore
-      }
-    },
-  };
 }
 
 function stopStreamJob(job: ServerStreamJob) {
@@ -1692,6 +1568,8 @@ async function startServer() {
         const checkProbe = await probeVideoFile(video.filePath);
         if (checkProbe.isValid) {
           video.hasAudio = checkProbe.hasAudio;
+          video.videoCodec = checkProbe.videoCodec;
+          video.audioCodec = checkProbe.audioCodec;
           video.durationSec = checkProbe.durationSec || video.durationSec || 6;
         } else {
           // Selected video is corrupt/incomplete (would cause FFmpeg code 183 AVERROR_INVALIDDATA)
@@ -1704,6 +1582,8 @@ async function startServer() {
         const fallbackSample = await ensureSampleVideo().catch(() => null);
         if (fallbackSample && fs.existsSync(fallbackSample.filePath)) {
           video = fallbackSample;
+          video.videoCodec = 'h264';
+          video.audioCodec = 'aac';
         }
       }
 
@@ -1713,6 +1593,20 @@ async function startServer() {
             'Uploaded video file not found on server. Please select or upload a video in Step 2 first.',
         });
         return;
+      }
+
+      // Ensure codec metadata is populated even for previously uploaded videos in uploads/videos.json
+      if (!video.videoCodec || !video.audioCodec) {
+        try {
+          const probed = await probeVideoFile(video.filePath);
+          video.hasAudio = probed.hasAudio;
+          video.durationSec = probed.durationSec || video.durationSec;
+          video.videoCodec = probed.videoCodec;
+          video.audioCodec = probed.audioCodec;
+          saveCatalog();
+        } catch {
+          // Non-fatal; fallback logic will handle copy/transcode automatically
+        }
       }
 
       if (!Array.isArray(destinations) || destinations.length === 0) {
@@ -1739,8 +1633,16 @@ async function startServer() {
 
       const destList = destinations as RtmpDestination[];
       const combinedLabel = destList
-        .map((d) => d.channelName || d.platform.toUpperCase())
+        .map((d) => d.channelName || (d.platform || 'RTMP').toUpperCase())
         .join(' + ');
+
+      const realDestinations = destList.filter(
+        (d) =>
+          d.streamKey !== 'yt-live-24x7-key' &&
+          d.streamKey !== 'FB-3948102948eQ-7' &&
+          !d.streamKey.startsWith('demo_')
+      );
+      const isPreviewOnly = realDestinations.length === 0;
 
       const job: ServerStreamJob = {
         jobId,
@@ -1759,55 +1661,166 @@ async function startServer() {
         startedAt: Date.now(),
         processes: [],
         cleanupHandlers: [],
-        lastLog: `Starting 24/7 Live Stream to ${combinedLabel}...`,
+        lastLog: isPreviewOnly
+          ? `[Preview Mode] Streaming "${video.originalName}" in smooth 24/7 loop. Paste your real YouTube/Facebook Stream Key in Step 1 to go live publicly.`
+          : `Starting 24/7 Live Stream to ${combinedLabel}...`,
         framesSent: 0,
         bitrateKbps: parseInt(videoBitrate, 10),
       };
 
-      let activeVideoFile = video;
-
-      const spawnDestinationLoopProcess = async (dest: RtmpDestination) => {
-        const label = dest.channelName || dest.platform.toUpperCase();
-        const isDemoPlaceholder =
-          dest.streamKey === 'yt-live-24x7-key' ||
-          dest.streamKey === 'FB-3948102948eQ-7' ||
-          dest.streamKey.startsWith('demo_');
-
-        let retryCount = 0;
-        let bridge: Awaited<ReturnType<typeof createPersistentRtmpBridge>> | null = null;
-
-        if (!isDemoPlaceholder) {
-          try {
-            bridge = await createPersistentRtmpBridge(() =>
-              buildFullRtmpUrl(dest.rtmpUrl, dest.streamKey, dest.platform, retryCount % 2 === 1)
-            );
-            job.cleanupHandlers?.push(() => bridge?.close());
-          } catch (err) {
-            job.errorMessage = `Failed to initialize RTMPS bridge for ${label}: ${
-              err instanceof Error ? err.message : String(err)
-            }`;
-            return;
+      const publishers: NativeRtmpPublisher[] = [];
+      const hub = new FlvPipeHub((videoFrames, measuredBitrateKbps) => {
+        if (job.status !== 'live') return;
+        if (measuredBitrateKbps > 0) {
+          job.bitrateKbps = measuredBitrateKbps;
+        }
+        if (isPreviewOnly) {
+          job.framesSent = videoFrames;
+          job.lastLog = `[Preview Mode] Streaming "${activeVideoFile.originalName}" · ${videoFrames} frames · ${job.bitrateKbps} kbps (Paste your real Stream Key in Step 1 to broadcast live).`;
+        } else {
+          const totalPublished = publishers.reduce((sum, p) => sum + p.framesPublished, 0);
+          if (totalPublished > 0) {
+            job.framesSent = totalPublished;
+            job.errorMessage = undefined;
+            job.lastLog = `[${combinedLabel}] LIVE · ${totalPublished} frames sent · ${job.bitrateKbps} kbps`;
           }
         }
+      });
 
-        const launchAttempt = async () => {
-          if (job.status !== 'live') return;
+      // Attach one pure Node.js NativeRtmpPublisher per real destination (zero 127.0.0.1 loopback, full TLS SNI)
+      for (const dest of realDestinations) {
+        const label = dest.channelName || (dest.platform || 'RTMP').toUpperCase();
+        const publisher = new NativeRtmpPublisher(
+          hub,
+          label,
+          (attempt) => buildFullRtmpUrl(dest.rtmpUrl, dest.streamKey, dest.platform, attempt),
+          {
+            onStatus: (status, detail) => {
+              if (job.status !== 'live') return;
+              const anyStreaming = publishers.some((p) => p.framesPublished > 0);
+              if (status === 'streaming') {
+                job.errorMessage = undefined;
+                job.lastLog = detail;
+              } else if (status === 'error') {
+                if (!anyStreaming) {
+                  job.errorMessage = detail;
+                }
+                job.lastLog = detail;
+              } else if (!anyStreaming) {
+                job.lastLog = detail;
+              }
+            },
+            onFrameSent: () => {
+              if (job.status !== 'live') return;
+              job.framesSent = publishers.reduce((sum, p) => sum + p.framesPublished, 0);
+              if (job.framesSent > 0 && job.errorMessage) {
+                job.errorMessage = undefined;
+              }
+            },
+          }
+        );
+        publishers.push(publisher);
+        job.cleanupHandlers?.push(() => publisher.stop());
+        publisher.start();
+      }
 
-          const args: string[] = [
-            '-nostdin',
-            '-y',
-            '-hide_banner',
-            '-loglevel',
-            'info',
-            '-filter_threads',
-            '1',
-            '-filter_complex_threads',
-            '1',
-            '-fflags',
-            '+genpts+igndts+discardcorrupt',
-            '-threads',
-            '1',
-          ];
+      let activeVideoFile = video;
+      let ffmpegRetryCount = 0;
+      // Start in Zero-CPU Stream Copy (3 threads, <1% CPU) automatically when no watermark/thumbnail overlay is needed and video is H.264
+      let useStreamCopyMode =
+        !effectiveShowLogo &&
+        !thumbFilePath &&
+        activeVideoFile.videoCodec === 'h264' &&
+        Boolean(activeVideoFile.hasAudio);
+
+      const spawnFlvProducer = async () => {
+        if (job.status !== 'live') return;
+
+        const args: string[] = [
+          '-nostdin',
+          '-y',
+          '-hide_banner',
+          '-loglevel',
+          'info',
+          '-fflags',
+          '+genpts+igndts+discardcorrupt',
+          '-threads',
+          '1',
+        ];
+
+        const canCopyVideo =
+          useStreamCopyMode &&
+          (activeVideoFile.videoCodec === 'h264' || !activeVideoFile.videoCodec);
+
+        if (canCopyVideo) {
+          // Hostinger Ultra-Low-Resource Zero-CPU Mode (3 OS threads, <1% CPU, 15 MB RAM)
+          if (loop247) {
+            args.push('-stream_loop', '-1');
+          }
+          args.push('-re', '-i', activeVideoFile.filePath);
+
+          if (!activeVideoFile.hasAudio) {
+            args.push(
+              '-threads',
+              '1',
+              '-f',
+              'lavfi',
+              '-i',
+              'anullsrc=channel_layout=stereo:sample_rate=44100',
+              '-map',
+              '0:v:0',
+              '-map',
+              '1:a:0',
+              '-c:v',
+              'copy',
+              '-c:a',
+              'aac',
+              '-threads',
+              '1',
+              '-b:a',
+              '128k',
+              '-ar',
+              '44100',
+              '-ac',
+              '2'
+            );
+            if (!loop247) args.push('-shortest');
+          } else if (activeVideoFile.audioCodec === 'aac' || !activeVideoFile.audioCodec) {
+            args.push(
+              '-map',
+              '0:v:0',
+              '-map',
+              '0:a:0?',
+              '-c:v',
+              'copy',
+              '-c:a',
+              'copy'
+            );
+          } else {
+            args.push(
+              '-map',
+              '0:v:0',
+              '-map',
+              '0:a:0?',
+              '-c:v',
+              'copy',
+              '-c:a',
+              'aac',
+              '-threads',
+              '1',
+              '-b:a',
+              '128k',
+              '-ar',
+              '44100',
+              '-ac',
+              '2'
+            );
+          }
+
+          args.push('-f', 'flv', '-flvflags', 'no_duration_filesize', 'pipe:1');
+        } else {
+          // Single-threaded libx264 transcode mode with optional watermark & thumbnail intro
+          args.push('-filter_threads', '1', '-filter_complex_threads', '1');
           if (loop247) {
             args.push('-stream_loop', '-1');
           }
@@ -1828,13 +1841,13 @@ async function startServer() {
           }
 
           let thumbInputIdx = -1;
-          if (retryCount === 0 && thumbFilePath && fs.existsSync(thumbFilePath)) {
+          if (ffmpegRetryCount === 0 && thumbFilePath && fs.existsSync(thumbFilePath)) {
             args.push('-threads', '1', '-i', thumbFilePath);
             thumbInputIdx = nextInputIdx++;
           }
 
           let logoInputIdx = -1;
-          if (retryCount <= 1 && logoFilePath && fs.existsSync(logoFilePath)) {
+          if (ffmpegRetryCount <= 1 && logoFilePath && fs.existsSync(logoFilePath)) {
             args.push('-threads', '1', '-i', logoFilePath);
             logoInputIdx = nextInputIdx++;
           }
@@ -1845,7 +1858,7 @@ async function startServer() {
           );
           let currentVidLabel = '[vbase]';
 
-          if (thumbInputIdx >= 0 && retryCount === 0) {
+          if (thumbInputIdx >= 0 && ffmpegRetryCount === 0) {
             const enableExpr = showThumbnailOverlay ? 'gte(t,0)' : 'between(t,0,4)';
             filterChains.push(
               `[${thumbInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[vthumbimg]`
@@ -1900,7 +1913,7 @@ async function startServer() {
             '-bufsize',
             bufSizeK,
             '-x264-params',
-            'nal-hrd=cbr:force-cfr=1:threads=1:lookahead-threads=1:sliced-threads=0',
+            'nal-hrd=cbr:force-cfr=1:threads=1:lookahead-threads=0:sliced-threads=0:sync-lookahead=0:rc-lookahead=0',
             '-pix_fmt',
             'yuv420p',
             '-g',
@@ -1926,72 +1939,117 @@ async function startServer() {
             '-f',
             'flv',
             '-flvflags',
-            'no_duration_filesize'
+            'no_duration_filesize',
+            'pipe:1'
           );
 
           if (!loop247 && !activeVideoFile.hasAudio) {
             args.push('-shortest');
           }
+        }
 
-          if (isDemoPlaceholder || !bridge) {
-            args.push('/dev/null');
-            job.lastLog = `[Preview Mode] Streaming "${activeVideoFile.originalName}" in smooth 24/7 loop (${effectiveShowLogo ? 'Logo ON' : 'Logo Hidden'}${thumbInputIdx >= 0 ? ' + 4s Thumbnail Intro' : ''}). Paste your real YouTube/Facebook Stream Key in Step 1 to go live publicly.`;
-          } else {
-            const { localRtmpUrl, tcUrl } = bridge.getConnectParams();
-            args.push('-rtmp_live', 'live', '-rtmp_tcurl', tcUrl, localRtmpUrl);
+        const proc = spawn(FFMPEG_BIN, args);
+        job.processes = [proc];
+
+        let producedBytes = 0;
+        let stderrTail = '';
+        let slowTranscodeHits = 0;
+
+        proc.stdout.on('data', (chunk: Buffer) => {
+          producedBytes += chunk.length;
+          hub.pushFlvData(chunk);
+        });
+
+        proc.stderr.on('data', (chunk: Buffer) => {
+          const text = chunk.toString();
+          stderrTail = (stderrTail + text).slice(-1400);
+          if (isPreviewOnly) {
+            parseFfmpegStats(text, job, combinedLabel);
           }
-
-          const proc = spawn(FFMPEG_BIN, args);
-          job.processes.push(proc);
-
-          let stderrTail = '';
-          proc.stderr.on('data', (chunk: Buffer) => {
-            const text = chunk.toString();
-            stderrTail = (stderrTail + text).slice(-1200);
-            parseFfmpegStats(text, job, label);
-          });
-
-          proc.on('error', (err) => {
-            job.errorMessage = `FFmpeg error (${label}): ${err.message}`;
-            job.lastLog = job.errorMessage;
-          });
-
-          proc.on('close', async (code) => {
-            job.processes = job.processes.filter((p) => p !== proc);
-            if (job.status !== 'live' || code === 0) return;
-
-            // If input video file caused AVERROR_INVALIDDATA (code 183), switch to guaranteed-valid sample video
-            if (
-              code === 183 ||
-              /Invalid data found when processing input|moov atom not found/i.test(stderrTail)
-            ) {
-              const fallback = await ensureSampleVideo().catch(() => null);
-              if (fallback && fs.existsSync(fallback.filePath)) {
-                activeVideoFile = fallback;
+          // If Hostinger shared CPU throttles libx264 below 0.55x real-time, auto-switch to Zero-CPU Stream Copy
+          if (
+            !useStreamCopyMode &&
+            (activeVideoFile.videoCodec === 'h264' || !activeVideoFile.videoCodec)
+          ) {
+            const speedMatch = text.match(/speed=\s*([\d.]+)x/);
+            if (speedMatch) {
+              const spd = parseFloat(speedMatch[1]);
+              if (Number.isFinite(spd) && spd > 0 && spd < 0.55) {
+                slowTranscodeHits += 1;
+                if (slowTranscodeHits >= 6) {
+                  useStreamCopyMode = true;
+                  job.lastLog = `[${combinedLabel}] Server CPU throttled (${spd}x) — auto-switching to Ultra-Light Stream Copy (1.0x)...`;
+                  try {
+                    proc.kill('SIGTERM');
+                  } catch {
+                    // ignore
+                  }
+                }
+              } else {
+                slowTranscodeHits = 0;
               }
             }
+          }
+        });
 
-            retryCount += 1;
-            if (retryCount <= 3 && job.framesSent === 0) {
-              job.lastLog = `[${label}] Connecting to live server (attempt ${retryCount + 1})...`;
-            } else if (job.framesSent === 0) {
-              job.errorMessage = `Waiting for ${label} Live Studio to accept stream key (auto-retrying every 2s)... Check that your ${label} Stream Key is active.`;
-              job.lastLog = job.errorMessage;
+        proc.on('error', (err) => {
+          job.errorMessage = `FFmpeg binary error: ${err.message}`;
+          job.lastLog = job.errorMessage;
+        });
+
+        proc.on('close', async (code, signal) => {
+          job.processes = job.processes.filter((p) => p !== proc);
+          if (job.status !== 'live') return;
+          if (code === 0 && !loop247) {
+            stopStreamJob(job);
+            activeJobs.delete(jobId);
+            return;
+          }
+
+          // If input file caused AVERROR_INVALIDDATA (code 183), switch to guaranteed-valid sample video
+          if (
+            code === 183 ||
+            /Invalid data found when processing input|moov atom not found/i.test(stderrTail)
+          ) {
+            const fallback = await ensureSampleVideo().catch(() => null);
+            if (fallback && fs.existsSync(fallback.filePath)) {
+              activeVideoFile = fallback;
+              activeVideoFile.videoCodec = 'h264';
+              activeVideoFile.audioCodec = 'aac';
             }
+          }
 
-            const delayMs = retryCount <= 2 ? 1000 : 2500;
-            setTimeout(() => {
-              void launchAttempt();
-            }, delayMs);
-          });
-        };
+          // If libx264 transcode failed due to Hostinger CloudLinux LVE thread/CPU/RAM limit (or emitted 0 bytes),
+          // immediately switch to Ultra-Low-Resource Zero-CPU Stream Copy Mode (3 threads, <1% CPU)!
+          const hitResourceLimit =
+            signal === 'SIGKILL' ||
+            producedBytes === 0 ||
+            /pthread_create|Resource temporarily unavailable|Cannot allocate memory|killed/i.test(
+              stderrTail
+            );
 
-        await launchAttempt();
+          if (!useStreamCopyMode && hitResourceLimit) {
+            useStreamCopyMode = true;
+            job.lastLog = `[${combinedLabel}] Switching to Hostinger Ultra-Light Stream Copy mode (3 threads, <1% CPU)...`;
+          } else if (producedBytes === 0) {
+            const errLine =
+              stderrTail
+                .split(/[\r\n]+/)
+                .filter((l) => /error|failed|unable|invalid|resource/i.test(l))
+                .slice(-1)[0] || `FFmpeg exited (code=${code}, signal=${signal || 'none'})`;
+            job.errorMessage = `Encoder restart (${combinedLabel}): ${errLine.slice(0, 140)}`;
+            job.lastLog = job.errorMessage;
+          }
+
+          ffmpegRetryCount += 1;
+          hub.resetForNewFlvStream();
+          setTimeout(() => {
+            void spawnFlvProducer();
+          }, 800);
+        });
       };
 
-      for (const dest of destList) {
-        void spawnDestinationLoopProcess(dest);
-      }
+      void spawnFlvProducer();
 
       activeJobs.set(jobId, job);
 
@@ -2060,6 +2118,31 @@ async function startServer() {
     res.json({ jobs });
   });
 
+  // Live Streaming Server Diagnostics (verifies FFmpeg + outbound RTMPS TLS to YouTube & Facebook on Hostinger)
+  app.get('/api/streams/diagnostics', async (_req, res) => {
+    const [ytProbe, fbProbe] = await Promise.all([
+      probeRtmpsEndpoint('a.rtmps.youtube.com', 443, 'live2'),
+      probeRtmpsEndpoint('live-api-s.facebook.com', 443, 'rtmp'),
+    ]);
+    res.json({
+      nodeVersion: process.version,
+      platform: process.platform,
+      ffmpegBinary: FFMPEG_BIN,
+      ffmpegExists: FFMPEG_BIN === 'ffmpeg' ? true : fs.existsSync(FFMPEG_BIN),
+      youtubeRtmps: ytProbe,
+      facebookRtmps: fbProbe,
+      activeJobsCount: activeJobs.size,
+      activeJobs: Array.from(activeJobs.values()).map((j) => ({
+        jobId: j.jobId,
+        status: j.status,
+        framesSent: j.framesSent,
+        bitrateKbps: j.bitrateKbps,
+        errorMessage: j.errorMessage,
+        lastLog: j.lastLog,
+      })),
+    });
+  });
+
   app.post('/api/streams/stop', (req, res) => {
     const { jobId, sessionId } = req.body || {};
     let stoppedCount = 0;
@@ -2118,170 +2201,214 @@ async function startServer() {
       job.cleanupHandlers = [];
     }
 
-    for (const dest of destinations) {
-      const label = dest.channelName || dest.platform.toUpperCase();
-      const isDemoPlaceholder =
-        dest.streamKey === 'yt-live-24x7-key' ||
-        dest.streamKey === 'FB-3948102948eQ-7' ||
-        dest.streamKey.startsWith('demo_');
+    const combinedLabel = destinations
+      .map((d) => d.channelName || (d.platform || 'RTMP').toUpperCase())
+      .join(' + ');
 
-      let bridge: Awaited<ReturnType<typeof createPersistentRtmpBridge>> | null = null;
-      if (!isDemoPlaceholder) {
-        try {
-          bridge = await createPersistentRtmpBridge(() =>
-            buildFullRtmpUrl(dest.rtmpUrl, dest.streamKey, dest.platform)
-          );
-          job.cleanupHandlers.push(() => bridge?.close());
-        } catch {
-          // fallback
+    const realDestinations = destinations.filter(
+      (d) =>
+        d.streamKey !== 'yt-live-24x7-key' &&
+        d.streamKey !== 'FB-3948102948eQ-7' &&
+        !d.streamKey.startsWith('demo_')
+    );
+    const isPreviewOnly = realDestinations.length === 0;
+
+    const publishers: NativeRtmpPublisher[] = [];
+    const hub = new FlvPipeHub((videoFrames, measuredBitrateKbps) => {
+      if (job.status !== 'live') return;
+      if (measuredBitrateKbps > 0) {
+        job.bitrateKbps = measuredBitrateKbps;
+      }
+      if (isPreviewOnly) {
+        job.framesSent = Math.max(job.framesSent, videoFrames);
+      } else {
+        const totalPublished = publishers.reduce((sum, p) => sum + p.framesPublished, 0);
+        if (totalPublished > 0) {
+          job.framesSent = totalPublished;
+          job.errorMessage = undefined;
+          job.lastLog = `[${combinedLabel}] Browser LIVE · ${totalPublished} frames sent · ${job.bitrateKbps} kbps`;
         }
       }
+    });
 
-      const args: string[] = [
-        '-y',
-        '-hide_banner',
-        '-loglevel',
-        'info',
-        '-filter_threads',
-        '1',
-        '-filter_complex_threads',
-        '1',
-        '-fflags',
-        '+genpts+igndts+discardcorrupt',
-        '-threads',
-        '1',
-        '-i',
-        'pipe:0',
-        '-threads',
-        '1',
-        '-f',
-        'lavfi',
-        '-i',
-        'anullsrc=channel_layout=stereo:sample_rate=44100',
-      ];
-
-      let nextInputIdx = 2;
-      let thumbInputIdx = -1;
-      if (thumbFilePath && fs.existsSync(thumbFilePath)) {
-        args.push('-threads', '1', '-i', thumbFilePath);
-        thumbInputIdx = nextInputIdx++;
-      }
-
-      let logoInputIdx = -1;
-      if (logoFilePath && fs.existsSync(logoFilePath)) {
-        args.push('-threads', '1', '-i', logoFilePath);
-        logoInputIdx = nextInputIdx++;
-      }
-
-      const filterChains: string[] = [];
-      filterChains.push(
-        `[0:v]fps=${fps},setpts=N/(${fps}*TB),scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[vbase]`
+    for (const dest of realDestinations) {
+      const label = dest.channelName || (dest.platform || 'RTMP').toUpperCase();
+      const publisher = new NativeRtmpPublisher(
+        hub,
+        label,
+        (attempt) => buildFullRtmpUrl(dest.rtmpUrl, dest.streamKey, dest.platform, attempt),
+        {
+          onStatus: (status, detail) => {
+            if (job.status !== 'live') return;
+            const anyStreaming = publishers.some((p) => p.framesPublished > 0);
+            if (status === 'streaming') {
+              job.errorMessage = undefined;
+              job.lastLog = detail;
+            } else if (status === 'error') {
+              if (!anyStreaming) job.errorMessage = detail;
+              job.lastLog = detail;
+            } else if (!anyStreaming) {
+              job.lastLog = detail;
+            }
+          },
+          onFrameSent: () => {
+            if (job.status !== 'live') return;
+            job.framesSent = publishers.reduce((sum, p) => sum + p.framesPublished, 0);
+            if (job.framesSent > 0 && job.errorMessage) {
+              job.errorMessage = undefined;
+            }
+          },
+        }
       );
-      let currentVidLabel = '[vbase]';
-
-      if (thumbInputIdx >= 0) {
-        const enableExpr = msg.showThumbnailOverlay ? 'gte(t,0)' : 'between(t,0,4)';
-        filterChains.push(
-          `[${thumbInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[vthumbimg]`
-        );
-        filterChains.push(
-          `${currentVidLabel}[vthumbimg]overlay=0:0:eof_action=repeat:format=yuv420:enable='${enableExpr}'[vwith_thumb]`
-        );
-        currentVidLabel = '[vwith_thumb]';
-      }
-
-      if (logoInputIdx >= 0) {
-        filterChains.push(
-          `[${logoInputIdx}:v]scale=160:-2,pad=iw+12:ih+8:6:4:color=white@0.95,format=yuv420p[vlogo]`
-        );
-        filterChains.push(
-          `${currentVidLabel}[vlogo]overlay=20:20:eof_action=repeat:format=yuv420[vout]`
-        );
-        currentVidLabel = '[vout]';
-      }
-
-      const gopSize = String(fps * 2);
-      const bufSizeK = `${parseInt(videoBitrate, 10) * 2}k`;
-
-      args.push(
-        '-filter_complex',
-        filterChains.join(';'),
-        '-map',
-        currentVidLabel,
-        '-map',
-        '1:a:0',
-        '-r',
-        String(fps),
-        '-c:v',
-        'libx264',
-        '-profile:v',
-        'main',
-        '-preset',
-        'ultrafast',
-        '-tune',
-        'zerolatency',
-        '-threads',
-        '1',
-        '-b:v',
-        videoBitrate,
-        '-minrate',
-        videoBitrate,
-        '-maxrate',
-        videoBitrate,
-        '-bufsize',
-        bufSizeK,
-        '-x264-params',
-        'nal-hrd=cbr:force-cfr=1:threads=1:lookahead-threads=1:sliced-threads=0',
-        '-pix_fmt',
-        'yuv420p',
-        '-g',
-        gopSize,
-        '-keyint_min',
-        gopSize,
-        '-sc_threshold',
-        '0',
-        '-flags',
-        '+global_header',
-        '-c:a',
-        'aac',
-        '-threads',
-        '1',
-        '-b:a',
-        '128k',
-        '-ar',
-        '44100',
-        '-ac',
-        '2',
-        '-max_muxing_queue_size',
-        '2048',
-        '-f',
-        'flv',
-        '-flvflags',
-        'no_duration_filesize'
-      );
-
-      if (isDemoPlaceholder || !bridge) {
-        args.push('/dev/null');
-      } else {
-        const { localRtmpUrl, tcUrl } = bridge.getConnectParams();
-        args.push('-rtmp_live', 'live', '-rtmp_tcurl', tcUrl, localRtmpUrl);
-      }
-
-      const proc = spawn(FFMPEG_BIN, args);
-
-      proc.stderr.on('data', (chunk: Buffer) => {
-        parseFfmpegStats(chunk.toString(), job, label);
-      });
-
-      proc.on('error', (err) => {
-        job.errorMessage = `RTMP error (${label}): ${err.message}`;
-        job.lastLog = job.errorMessage;
-      });
-
-      proc.stdin.on('error', () => {});
-
-      job.processes.push(proc);
+      publishers.push(publisher);
+      job.cleanupHandlers.push(() => publisher.stop());
+      publisher.start();
     }
+
+    const args: string[] = [
+      '-y',
+      '-hide_banner',
+      '-loglevel',
+      'info',
+      '-filter_threads',
+      '1',
+      '-filter_complex_threads',
+      '1',
+      '-fflags',
+      '+genpts+igndts+discardcorrupt',
+      '-threads',
+      '1',
+      '-i',
+      'pipe:0',
+      '-threads',
+      '1',
+      '-f',
+      'lavfi',
+      '-i',
+      'anullsrc=channel_layout=stereo:sample_rate=44100',
+    ];
+
+    let nextInputIdx = 2;
+    let thumbInputIdx = -1;
+    if (thumbFilePath && fs.existsSync(thumbFilePath)) {
+      args.push('-threads', '1', '-i', thumbFilePath);
+      thumbInputIdx = nextInputIdx++;
+    }
+
+    let logoInputIdx = -1;
+    if (logoFilePath && fs.existsSync(logoFilePath)) {
+      args.push('-threads', '1', '-i', logoFilePath);
+      logoInputIdx = nextInputIdx++;
+    }
+
+    const filterChains: string[] = [];
+    filterChains.push(
+      `[0:v]fps=${fps},setpts=N/(${fps}*TB),scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[vbase]`
+    );
+    let currentVidLabel = '[vbase]';
+
+    if (thumbInputIdx >= 0) {
+      const enableExpr = msg.showThumbnailOverlay ? 'gte(t,0)' : 'between(t,0,4)';
+      filterChains.push(
+        `[${thumbInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[vthumbimg]`
+      );
+      filterChains.push(
+        `${currentVidLabel}[vthumbimg]overlay=0:0:eof_action=repeat:format=yuv420:enable='${enableExpr}'[vwith_thumb]`
+      );
+      currentVidLabel = '[vwith_thumb]';
+    }
+
+    if (logoInputIdx >= 0) {
+      filterChains.push(
+        `[${logoInputIdx}:v]scale=160:-2,pad=iw+12:ih+8:6:4:color=white@0.95,format=yuv420p[vlogo]`
+      );
+      filterChains.push(
+        `${currentVidLabel}[vlogo]overlay=20:20:eof_action=repeat:format=yuv420[vout]`
+      );
+      currentVidLabel = '[vout]';
+    }
+
+    const gopSize = String(fps * 2);
+    const bufSizeK = `${parseInt(videoBitrate, 10) * 2}k`;
+
+    args.push(
+      '-filter_complex',
+      filterChains.join(';'),
+      '-map',
+      currentVidLabel,
+      '-map',
+      '1:a:0',
+      '-r',
+      String(fps),
+      '-c:v',
+      'libx264',
+      '-profile:v',
+      'main',
+      '-preset',
+      'ultrafast',
+      '-tune',
+      'zerolatency',
+      '-threads',
+      '1',
+      '-b:v',
+      videoBitrate,
+      '-minrate',
+      videoBitrate,
+      '-maxrate',
+      videoBitrate,
+      '-bufsize',
+      bufSizeK,
+      '-x264-params',
+      'nal-hrd=cbr:force-cfr=1:threads=1:lookahead-threads=0:sliced-threads=0:sync-lookahead=0:rc-lookahead=0',
+      '-pix_fmt',
+      'yuv420p',
+      '-g',
+      gopSize,
+      '-keyint_min',
+      gopSize,
+      '-sc_threshold',
+      '0',
+      '-flags',
+      '+global_header',
+      '-c:a',
+      'aac',
+      '-threads',
+      '1',
+      '-b:a',
+      '128k',
+      '-ar',
+      '44100',
+      '-ac',
+      '2',
+      '-max_muxing_queue_size',
+      '2048',
+      '-f',
+      'flv',
+      '-flvflags',
+      'no_duration_filesize',
+      'pipe:1'
+    );
+
+    const proc = spawn(FFMPEG_BIN, args);
+
+    proc.stdout.on('data', (chunk: Buffer) => {
+      hub.pushFlvData(chunk);
+    });
+
+    proc.stderr.on('data', (chunk: Buffer) => {
+      if (isPreviewOnly) {
+        parseFfmpegStats(chunk.toString(), job, combinedLabel);
+      }
+    });
+
+    proc.on('error', (err) => {
+      job.errorMessage = `RTMP error (${combinedLabel}): ${err.message}`;
+      job.lastLog = job.errorMessage;
+    });
+
+    proc.stdin.on('error', () => {});
+
+    job.processes.push(proc);
   };
 
   app.post('/api/streams/browser-start', async (req, res) => {
@@ -2412,15 +2539,7 @@ async function startServer() {
             ws.send(JSON.stringify({ type: 'started', jobId }));
           } else if (msg.type === 'stop') {
             if (currentJob) {
-              currentJob.status = 'stopped';
-              for (const proc of currentJob.processes) {
-                try {
-                  proc.stdin.end();
-                  proc.kill('SIGTERM');
-                } catch {
-                  // ignore
-                }
-              }
+              stopStreamJob(currentJob);
               activeJobs.delete(currentJob.jobId);
               currentJob = null;
             }
@@ -2430,7 +2549,6 @@ async function startServer() {
         }
       } else if (currentJob && currentJob.status === 'live') {
         const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-        currentJob.framesSent += 1;
         for (const proc of currentJob.processes) {
           if (proc.stdin && !proc.stdin.destroyed && proc.stdin.writable) {
             try {
@@ -2445,15 +2563,7 @@ async function startServer() {
 
     ws.on('close', () => {
       if (currentJob) {
-        currentJob.status = 'stopped';
-        for (const proc of currentJob.processes) {
-          try {
-            proc.stdin.end();
-            proc.kill('SIGTERM');
-          } catch {
-            // ignore
-          }
-        }
+        stopStreamJob(currentJob);
         activeJobs.delete(currentJob.jobId);
         currentJob = null;
       }
