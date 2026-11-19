@@ -68,6 +68,7 @@ import AdminPanel, {
   PaymentRecord,
   MainPageSettings,
 } from './AdminPanel';
+import LegalPoliciesModal, { LegalPolicyTab } from './LegalPoliciesModal';
 
 interface UploadedVideo {
   id: string;
@@ -293,6 +294,39 @@ export default function App() {
   // Sign In / Mobile Login Modal State
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authModalMode, setAuthModalMode] = useState<'mobile' | 'email' | 'google'>('mobile');
+
+  // Legal Policy Modal State (supports direct links like /terms, /privacy, /refund or #terms, #privacy, #refund)
+  const [legalModalTab, setLegalModalTab] = useState<LegalPolicyTab | null>(() => {
+    try {
+      const loc = `${window.location.pathname} ${window.location.hash}`.toLowerCase();
+      if (loc.includes('privacy')) return 'privacy';
+      if (loc.includes('refund')) return 'refund';
+      if (loc.includes('terms')) return 'terms';
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+
+  const openLegalPolicy = (tab: LegalPolicyTab) => {
+    setLegalModalTab(tab);
+    try {
+      window.history.replaceState(null, '', `#${tab}`);
+    } catch {
+      // ignore
+    }
+  };
+
+  const closeLegalPolicy = () => {
+    setLegalModalTab(null);
+    try {
+      if (window.location.hash === '#terms' || window.location.hash === '#privacy' || window.location.hash === '#refund') {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      }
+    } catch {
+      // ignore
+    }
+  };
   const [mobileOrEmailInput, setMobileOrEmailInput] = useState('');
   const [nameInput, setNameInput] = useState('');
   const [googleDomainNotice, setGoogleDomainNotice] = useState<string | null>(null);
@@ -3160,8 +3194,48 @@ export default function App() {
                 <span>{siteSettings.supportEmail}</span>
               </a>
             </div>
-            <p className="text-[11px] text-slate-500 pt-2">© 2026 creatorlive247.com</p>
           </div>
+        </div>
+
+        {/* Bottom Legal Links Bar: Terms & Conditions, Privacy Policy, Refund Policy */}
+        <div className="max-w-5xl mx-auto mt-8 pt-6 border-t border-slate-800/80 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs">
+          <p className="text-[11px] text-slate-500">
+            © 2026 {siteSettings.websiteName} (creatorlive247.com). All rights reserved.
+          </p>
+          <nav aria-label="Legal policies" className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
+            <a
+              href="#terms"
+              onClick={(e) => {
+                e.preventDefault();
+                openLegalPolicy('terms');
+              }}
+              className="text-slate-300 hover:text-white transition-colors font-medium cursor-pointer"
+            >
+              Terms &amp; Conditions
+            </a>
+            <span className="text-slate-700 select-none" aria-hidden="true">·</span>
+            <a
+              href="#privacy"
+              onClick={(e) => {
+                e.preventDefault();
+                openLegalPolicy('privacy');
+              }}
+              className="text-slate-300 hover:text-white transition-colors font-medium cursor-pointer"
+            >
+              Privacy Policy
+            </a>
+            <span className="text-slate-700 select-none" aria-hidden="true">·</span>
+            <a
+              href="#refund"
+              onClick={(e) => {
+                e.preventDefault();
+                openLegalPolicy('refund');
+              }}
+              className="text-slate-300 hover:text-white transition-colors font-medium cursor-pointer"
+            >
+              Refund Policy
+            </a>
+          </nav>
         </div>
       </footer>
 
@@ -3508,6 +3582,20 @@ export default function App() {
             </div>
           </form>
         </div>
+      )}
+
+      {/* ==================== LEGAL POLICIES MODAL (TERMS, PRIVACY, REFUND) ==================== */}
+      {legalModalTab && (
+        <LegalPoliciesModal
+          activeTab={legalModalTab}
+          onChangeTab={(tab) => openLegalPolicy(tab)}
+          onClose={closeLegalPolicy}
+          websiteName={siteSettings.websiteName}
+          businessAddress={siteSettings.businessAddress}
+          supportEmail={siteSettings.supportEmail}
+          mobileNumber={siteSettings.mobileNumber}
+          whatsappNumber={siteSettings.whatsappNumber}
+        />
       )}
     </div>
   );
